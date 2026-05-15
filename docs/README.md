@@ -12,4 +12,5 @@ build it; everything below digs into one area in depth.
 | [keybindings.md](keybindings.md) | Every shortcut the chrome wires today, with macOS / Linux equivalents. |
 | [dev-dock.md](dev-dock.md)         | XHR / Console / Source viewers — what they show, where capture happens. |
 | [contributing.md](contributing.md) | Setup, code style, conventions, how to add a CSS property or a chrome surface. |
+| [js-engine-plan.md](js-engine-plan.md) | Six-phase roadmap from the current "JS stubs only" state to real Google search end-to-end (Zinc upvalue fix → host-object alloc → addEventListener firing → fetch/XHR → setTimeout → drop fallback). |
 | [screenshot.png](screenshot.png)   | Reference render of Copper showing the IDE-Pane chrome on Wikipedia. |

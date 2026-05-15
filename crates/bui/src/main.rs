@@ -622,43 +622,19 @@ fn is_google_search_host(host: &str) -> bool {
         })
 }
 
-/// A search engine submission needs an HTML-only endpoint to land
-/// somewhere useful in a JS-less browser. Google's `/search` used
-/// to serve a static "basic HTML" version via `?gbv=1`, but as of
-/// 2024+ that path returns a `<noscript><meta refresh>` trap
-/// pointing at `/httpservice/retry/enablejs` regardless of cookies
-/// or User-Agent. The consent flow on top (POST-only form, our
-/// chrome only submits GET) compounds the problem with a 405.
+/// No-op pass-through. We used to redirect google.com/search to
+/// DuckDuckGo's HTML endpoint as a stand-in for non-JS search,
+/// but the user wants real Google. Without a working JS engine
+/// (see `docs/js-engine-plan.md`) /search lands on Google's
+/// `<noscript><meta refresh>` enable-JS notice — that's the
+/// honest behaviour we ship for now. The `seed_google_consent`
+/// cookies still bypass the consent gate so the user doesn't
+/// even hit the 405-after-accept flow.
 ///
-/// Until we have real JS, we redirect every Google `/search` to
-/// **DuckDuckGo's `/html/` endpoint**, which still serves real
-/// server-rendered results — `<a class="result__a" href="…">`
-/// links the rest of the chrome can follow. Same `q=` parameter,
-/// same submission ergonomics from the user's side. The dev-dock
-/// Console picks up the redirect via the URL change.
+/// Removed once Phase 6 of the JS-engine milestone lands and we
+/// can render Google's modern results inline.
 fn maybe_rewrite_google_search(url: &Url) -> Url {
-    if !is_google_search_host(&url.host) {
-        return url.clone();
-    }
-    if !url.path.starts_with("/search") {
-        return url.clone();
-    }
-    // Extract the user's query (`q=…`). If we can't find it just
-    // leave the URL alone — better to land on Google's error than
-    // to send the user to a query-less DDG.
-    let q = url.query.as_deref().and_then(|qs| {
-        qs.split('&').find_map(|p| p.strip_prefix("q="))
-    });
-    let Some(q) = q else { return url.clone() };
-    if q.is_empty() {
-        return url.clone();
-    }
-    let Ok(ddg_base) = Url::parse("https://duckduckgo.com/html/") else {
-        return url.clone();
-    };
-    let mut ddg = ddg_base;
-    ddg.query = Some(format!("q={q}"));
-    ddg
+    url.clone()
 }
 
 /// Fetch a CSS URL, parse it, and inline any `@import` rules in
@@ -4247,67 +4223,26 @@ mod tests {
     }
 
     #[test]
-    fn google_search_redirects_to_ddg_html() {
-        // Google's modern /search rejects every non-JS client even
-        // with the legacy `gbv=1` flag (the body is a noscript meta-
-        // refresh to /httpservice/retry/enablejs that 405s). We
-        // redirect /search?q=X to DuckDuckGo's HTML endpoint, which
-        // still serves real server-rendered result links.
+    fn google_search_is_pass_through() {
+        // The function is currently a no-op (see its docstring):
+        // we route real Google traffic to Google. The user sees
+        // the "please enable JS" notice until the JS-engine
+        // milestone (docs/js-engine-plan.md) lands. Once it does
+        // we'll either delete this test or repurpose it to assert
+        // that the modern Google homepage renders + submits.
         fn rw(s: &str) -> String {
             let u = Url::parse(s).unwrap();
             maybe_rewrite_google_search(&u).to_string()
         }
-        // Apex + www on .com.
-        assert_eq!(
-            rw("https://google.com/search?q=x"),
-            "https://duckduckgo.com/html/?q=x",
-        );
-        assert_eq!(
-            rw("https://www.google.com/search?q=x"),
-            "https://duckduckgo.com/html/?q=x",
-        );
-        // Locale ccTLDs all route through the same fallback.
-        assert_eq!(
-            rw("https://www.google.de/search?q=x"),
-            "https://duckduckgo.com/html/?q=x",
-        );
-        assert_eq!(
-            rw("https://google.fr/search?q=x"),
-            "https://duckduckgo.com/html/?q=x",
-        );
-        assert_eq!(
-            rw("https://www.google.co.uk/search?q=x"),
-            "https://duckduckgo.com/html/?q=x",
-        );
-        assert_eq!(
-            rw("https://google.com.br/search?q=x"),
-            "https://duckduckgo.com/html/?q=x",
-        );
-        // Subdomained Google products are NOT search.
-        assert_eq!(
-            rw("https://scholar.google.com/search?q=x"),
+        for raw in [
+            "https://google.com/search?q=x",
+            "https://www.google.de/search?q=x",
             "https://scholar.google.com/search?q=x",
-        );
-        assert_eq!(
-            rw("https://news.google.com/search?q=x"),
-            "https://news.google.com/search?q=x",
-        );
-        // Lookalike host with extra labels — must NOT be rewritten.
-        assert_eq!(
-            rw("https://google.evilattacker.com/search?q=x"),
             "https://google.evilattacker.com/search?q=x",
-        );
-        // Path mismatch: only `/search` gets the rewrite.
-        assert_eq!(
-            rw("https://google.de/maps?q=x"),
             "https://google.de/maps?q=x",
-        );
-        // No q parameter — leave alone (the homepage submit always
-        // includes one).
-        assert_eq!(
-            rw("https://google.com/search"),
-            "https://google.com/search",
-        );
+        ] {
+            assert_eq!(rw(raw), raw);
+        }
     }
 
     #[test]
