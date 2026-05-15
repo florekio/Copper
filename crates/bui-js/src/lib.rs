@@ -95,27 +95,7 @@ pub fn execute_inline_scripts_with_dom(
 
     let mut out = Vec::with_capacity(scripts.len());
     for (node, source) in scripts {
-        // Zinc has a known panic in upvalue-closing on deeply-nested
-        // closures (vm.rs:663). On heavy pages (google.com) this
-        // sometimes fires. `catch_unwind` keeps a single bad script
-        // from killing the entire browser; the panicked script's
-        // contribution is dropped and execution continues with the
-        // next `<script>` block.
-        //
-        // `AssertUnwindSafe` is fine here: `engine` is mutable
-        // state we discard right after the loop if anything went
-        // wrong, and the DOM is recovered by the outer style + layout
-        // pass independent of script execution.
-        let result_pair = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.eval_with_output(&source)
-        }));
-        let (result, mut output) = match result_pair {
-            Ok(pair) => pair,
-            Err(_) => (
-                "Error: zinc VM panic during script (skipped)".to_string(),
-                Vec::new(),
-            ),
-        };
+        let (result, mut output) = engine.eval_with_output(&source);
         // Zinc's eval_with_output returns the error message in
         // `result_str` (prefixed `SyntaxError:` / `CompileError:` /
         // `Error:`) when a script faults. Surface it as a log line
