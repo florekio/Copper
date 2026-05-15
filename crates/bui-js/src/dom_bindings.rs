@@ -93,6 +93,10 @@ pub struct BindingContext {
     shared: Arc<Mutex<DomShared>>,
     elem_tag: HostTag,
     dirty: Arc<AtomicBool>,
+    /// URL JS asked us to navigate to via `location.href = ...` (or
+    /// `location.assign(...)` / `location.replace(...)`). Drained
+    /// once by the embedder after the script pass completes.
+    pending_navigation: Arc<Mutex<Option<String>>>,
 }
 
 impl BindingContext {
@@ -100,7 +104,15 @@ impl BindingContext {
     /// against `engine`. The document handle is shared with the
     /// embedder so mutations made by scripts are visible to the
     /// next style + layout pass.
-    pub fn install(engine: &mut Engine, doc: Arc<Mutex<Document>>) -> Self {
+    ///
+    /// `current_url` is the URL the page was fetched from. It backs
+    /// `window.location.href` getter (read-only properties of
+    /// `location` like `.pathname` etc. all derive from this string).
+    pub fn install(
+        engine: &mut Engine,
+        doc: Arc<Mutex<Document>>,
+        current_url: String,
+    ) -> Self {
         let elem_tag = engine.register_host_class("HTMLElement");
 
         let mut handles_by_node: HashMap<NodeId, Value> = HashMap::new();
@@ -644,10 +656,34 @@ impl BindingContext {
             Ok(Value::boolean(now_present))
         });
 
+        // ---- Navigation side channel -----
+        //
+        // `__current_url` returns the page's URL (interned per
+        // install — `window.location.href` getter routes through
+        // it). `__navigate` records a URL the script wants the
+        // browser to load; the embedder drains
+        // `pending_navigation` after the script pass and turns
+        // it into a real `navigate_to(...)` call.
+
+        let pending_navigation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let url_for_getter = current_url.clone();
+        engine.register_host_fn("__current_url", move |vm, _this, _args| {
+            Ok(vm.value_from_str(&url_for_getter))
+        });
+        let pending = pending_navigation.clone();
+        engine.register_host_fn("__navigate", move |vm, _this, args| {
+            if let Some(s) = read_str(vm, args.first()) {
+                if let Ok(mut g) = pending.lock() {
+                    *g = Some(s);
+                }
+            }
+            Ok(Value::null())
+        });
+
         // ---- JS prelude wrapping the `__` host fns ----
         let _ = engine.eval(PRELUDE);
 
-        BindingContext { shared, elem_tag, dirty }
+        BindingContext { shared, elem_tag, dirty, pending_navigation }
     }
 
     /// Number of allocated host handles. After mutations, this is
@@ -668,6 +704,14 @@ impl BindingContext {
     /// pass.
     pub fn dirty(&self) -> Arc<AtomicBool> {
         self.dirty.clone()
+    }
+
+    /// Drain the URL JS asked us to navigate to via
+    /// `window.location.href = ...` (or `.assign` / `.replace`).
+    /// Returns `None` if no script touched it. The embedder calls
+    /// this once after the script pass completes.
+    pub fn take_pending_navigation(&self) -> Option<String> {
+        self.pending_navigation.lock().ok()?.take()
     }
 }
 
@@ -851,7 +895,32 @@ var document = {
         return _wrapElem(__docCreateTextNode(text));
     }
 };
-var window = { document: document };
+function __noop() {}
+document.addEventListener = __noop;
+document.removeEventListener = __noop;
+document.documentElement = {
+    addEventListener: __noop,
+    removeEventListener: __noop
+};
+var location = { href: '', assign: __navigate, replace: __navigate, reload: __noop };
+var navigator = { userAgent: 'bui/0.1', language: 'en-US' };
+var history = { length: 1, state: null, pushState: __noop, replaceState: __noop, back: __noop, forward: __noop, go: __noop };
+var window = {
+    document: document,
+    location: location,
+    navigator: navigator,
+    history: history,
+    fetch: __noop,
+    setTimeout: __noop,
+    clearTimeout: __noop,
+    requestAnimationFrame: __noop,
+    addEventListener: __noop,
+    removeEventListener: __noop,
+    innerWidth: 1400,
+    innerHeight: 900
+};
+var google = {};
+var self = window;
 "#;
 
 #[cfg(test)]
@@ -872,7 +941,7 @@ mod tests {
                 .filter(|n| d.element(*n).is_some())
                 .count()
         };
-        let ctx = BindingContext::install(&mut engine, doc);
+        let ctx = BindingContext::install(&mut engine, doc, String::new());
         assert_eq!(ctx.element_count(), pre_count);
     }
 
@@ -880,7 +949,7 @@ mod tests {
     fn document_body_returns_handle() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><p>hi</p></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let res = engine
             .eval("document.body !== null && document.body !== undefined")
             .expect("eval");
@@ -891,7 +960,7 @@ mod tests {
     fn query_selector_returns_handle_or_null() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><h1>hi</h1><p class=note>x</p></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let hit = engine
             .eval("document.querySelector('.note') !== null")
             .expect("eval");
@@ -906,7 +975,7 @@ mod tests {
     fn get_element_by_id_works() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><p id=hello>hi</p></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let hit = engine
             .eval("document.getElementById('hello') !== null")
             .expect("eval");
@@ -917,7 +986,7 @@ mod tests {
     fn matches_selector() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><div class=card>x</div></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let res = engine
             .eval("document.querySelector('.card').matches('div')")
             .expect("eval");
@@ -928,7 +997,7 @@ mod tests {
     fn parent_element_walks_up() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><div><p>x</p></div></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let res = engine
             .eval("document.querySelector('p').parentElement.matches('div')")
             .expect("eval");
@@ -939,7 +1008,7 @@ mod tests {
     fn child_count_and_child_at() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><p>a</p><p>b</p><p>c</p></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let count = engine
             .eval("document.body.childCount")
             .expect("eval")
@@ -955,7 +1024,7 @@ mod tests {
     fn has_attribute_and_class() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><a href=#x class='btn primary'>go</a></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let has_href = engine
             .eval("document.querySelector('a').hasAttribute('href')")
             .expect("eval");
@@ -974,7 +1043,7 @@ mod tests {
     fn tag_name_uppercases() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><h1>hi</h1></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let (tag, _output) = engine.eval_with_output("document.querySelector('h1').tagName");
         assert_eq!(tag, "H1");
     }
@@ -983,7 +1052,7 @@ mod tests {
     fn id_and_class_strings() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><div id=main class='card primary'>x</div></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let (id, _) = engine.eval_with_output("document.querySelector('div').id");
         assert_eq!(id, "main");
         let (cls, _) = engine.eval_with_output("document.querySelector('div').className");
@@ -994,7 +1063,7 @@ mod tests {
     fn text_content_concatenates_descendants() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><p>hello <b>brave</b> world</p></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let (text, _) = engine.eval_with_output("document.querySelector('p').textContent");
         assert_eq!(text, "hello brave world");
     }
@@ -1005,7 +1074,7 @@ mod tests {
         let doc = wrapped_doc(
             "<body><div>visible<script>var x = 1;</script><style>p{color:red}</style>end</div></body>",
         );
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let (text, _) = engine.eval_with_output("document.querySelector('div').textContent");
         assert_eq!(text, "visibleend");
     }
@@ -1014,7 +1083,7 @@ mod tests {
     fn get_attribute_returns_value_or_null() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><a href='/x' class='c'>go</a></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let (href, _) = engine.eval_with_output("document.querySelector('a').getAttribute('href')");
         assert_eq!(href, "/x");
         let res = engine
@@ -1027,7 +1096,7 @@ mod tests {
     fn children_returns_array_of_wrapped_elements() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><ul><li>a</li><li>b</li><li>c</li></ul></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let len = engine
             .eval("document.querySelector('ul').children.length")
             .expect("eval");
@@ -1042,7 +1111,7 @@ mod tests {
     fn class_list_returns_string_array() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><div class='a b c'>x</div></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let (joined, _) = engine.eval_with_output(
             "var cl = document.querySelector('div').classList; var r = []; for (var i=0;i<cl.length;i++) r.push(cl[i]); r.join(',')",
         );
@@ -1056,7 +1125,7 @@ mod tests {
     fn query_selector_all_returns_array() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><p>a</p><p>b</p><p>c</p></body>");
-        let _ctx = BindingContext::install(&mut engine, doc);
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
         let n = engine
             .eval("document.querySelectorAll('p').length")
             .expect("eval");
@@ -1069,7 +1138,7 @@ mod tests {
     fn set_attribute_writes_through_to_doc() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><a>go</a></body>");
-        let ctx = BindingContext::install(&mut engine, doc.clone());
+        let ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
         engine
             .eval("document.querySelector('a').setAttribute('href', '/result')")
             .expect("eval");
@@ -1089,7 +1158,7 @@ mod tests {
     fn remove_attribute_drops_value_from_doc() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><a href='/x'>go</a></body>");
-        let _ctx = BindingContext::install(&mut engine, doc.clone());
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
         engine
             .eval("document.querySelector('a').removeAttribute('href')")
             .expect("eval");
@@ -1105,7 +1174,7 @@ mod tests {
     fn text_content_setter_replaces_children() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><p>old <b>kids</b></p></body>");
-        let _ctx = BindingContext::install(&mut engine, doc.clone());
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
         engine
             .eval("document.querySelector('p').textContent = 'fresh'")
             .expect("eval");
@@ -1125,7 +1194,7 @@ mod tests {
     fn create_element_then_append_adds_to_dom() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body></body>");
-        let ctx = BindingContext::install(&mut engine, doc.clone());
+        let ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
         engine
             .eval(
                 "var p = document.createElement('p'); \
@@ -1153,7 +1222,7 @@ mod tests {
     fn class_list_add_remove_toggle_updates_class_attr() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body><div class='a'>x</div></body>");
-        let _ctx = BindingContext::install(&mut engine, doc.clone());
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
         engine
             .eval("document.querySelector('div').classList.add('b')")
             .expect("eval");

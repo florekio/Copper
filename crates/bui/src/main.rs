@@ -1227,11 +1227,25 @@ impl TabState {
         // immediately below so the hint is informational only at
         // fetch time; it'll be load-bearing once timers / events
         // fire scripts AFTER the initial layout.
-        let (outcomes, _dirty) = bui_js::execute_inline_scripts_with_dom(doc.clone());
+        let (outcomes, _dirty, pending_nav) =
+            bui_js::execute_inline_scripts_with_dom(doc.clone(), url.to_string());
         for outcome in outcomes {
             for line in &outcome.output {
                 eprintln!("[js] {line}");
                 console_log.push(line.clone());
+            }
+        }
+        // If a script set `window.location.href`, resolve it against
+        // the current URL and follow the redirect by recursing once
+        // into `TabState::fetch`. One-shot: the recursion's own
+        // pending-nav drain handles a chain, capped only by the
+        // server / cookie state (we don't loop forever in this
+        // function — recursion bounds itself by call depth).
+        if let Some(target) = pending_nav {
+            if let Ok(next_url) = url.join(&target) {
+                if next_url.to_string() != url.to_string() {
+                    return TabState::fetch(&next_url);
+                }
             }
         }
         let dlocked = doc.lock().unwrap();

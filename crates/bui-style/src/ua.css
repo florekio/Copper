@@ -116,6 +116,53 @@ textarea { display: inline-block; padding: 2px 4px; border: 1px gray; background
 .mw-logo-tagline  { width: 120px !important }
 .vector-header-start { position: relative !important; z-index: 1 !important }
 
+/* ------------------------------------------------------------------
+   google.com (modern homepage) overrides
+   ------------------------------------------------------------------
+   Google's CSS uses a heavily-nested flex/grid layout that our
+   layout engine doesn't yet size correctly — the search input
+   (`<input name="q">` or `<textarea name="q">`) ends up at x≈1517
+   with width 0, off-screen. Until layout-side parity catches up,
+   pin the search input + the surrounding form to a predictable
+   centred pill so the user can actually type a query. */
+input[name="q"], textarea[name="q"] {
+    position: absolute !important;
+    left: 50% !important;
+    top: 280px !important;
+    transform: translateX(-50%) !important;
+    width: 580px !important;
+    height: 44px !important;
+    padding: 10px 16px !important;
+    border: 1.5px solid #D8D1BF !important;
+    border-radius: 24px !important;
+    background: #FFFFFF !important;
+    color: #1A1815 !important;
+    font-size: 16px !important;
+    z-index: 100 !important;
+    box-sizing: border-box !important;
+}
+/* The legacy basic-HTML version Google serves to non-JS UAs uses
+   `<input class="lst" name="q">` inside `<form action="/search">`.
+   Same fix applies. */
+input.lst { position: absolute !important; }
+/* Hide Google's microphone + Lens icon buttons (decorative SVG mask
+   icons that render as black squares we can't decode). */
+button.UbbAWe, div.fzj3ad, div.etxtjc, .Gdd5U, .HBcjWf { display: none !important; }
+/* The "Google Search" submit button — center it under the input. */
+input[type="submit"].lst, input[name="btnG"], button.plR5qb {
+    position: absolute !important;
+    left: 50% !important;
+    top: 340px !important;
+    transform: translateX(-50%) !important;
+    padding: 8px 18px !important;
+    border: 1.5px solid #D8D1BF !important;
+    border-radius: 6px !important;
+    background: #F0EBDE !important;
+    color: #1A1815 !important;
+    font-size: 13px !important;
+    z-index: 100 !important;
+}
+
 /* Mask-image icons render as solid dark rectangles because we don't
    decode CSS masks. Strip the visible payload (background-color +
    background-image) on every Codex / Vector icon class so they

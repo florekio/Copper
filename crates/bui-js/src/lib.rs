@@ -68,12 +68,20 @@ pub fn execute_inline_scripts(doc: &Document) -> Vec<ScriptOutcome> {
 /// mutations made by scripts (setAttribute, appendChild, createElement,
 /// classList.add, …) are visible to the caller after this returns.
 ///
-/// Returns `(outcomes, dirty)` where `dirty` is the shared flag the
-/// bindings tripped on every mutation — the orchestrator uses it to
-/// decide whether to re-style + re-layout before paint.
+/// `current_url` is what `window.location.href` reports during the
+/// script pass (read-only properties of `location` derive from it).
+///
+/// Returns `(outcomes, dirty, pending_nav)`:
+/// - `dirty` is the shared flag the bindings tripped on every mutation —
+///   the orchestrator uses it to decide whether to re-style + re-layout
+///   before paint.
+/// - `pending_nav` is `Some(url)` when a script asked us to navigate
+///   via `window.location.href = …` (or `.assign` / `.replace`);
+///   the embedder turns it into a real navigation.
 pub fn execute_inline_scripts_with_dom(
     doc: Arc<Mutex<Document>>,
-) -> (Vec<ScriptOutcome>, bool) {
+    current_url: String,
+) -> (Vec<ScriptOutcome>, bool, Option<String>) {
     // Collect script sources up front. We hold the doc lock only
     // for the walk so install + eval can take it themselves.
     let scripts = {
@@ -82,12 +90,40 @@ pub fn execute_inline_scripts_with_dom(
     };
 
     let mut engine = Engine::new();
-    let ctx = BindingContext::install(&mut engine, doc);
+    let ctx = BindingContext::install(&mut engine, doc, current_url);
     let dirty_flag = ctx.dirty();
 
     let mut out = Vec::with_capacity(scripts.len());
     for (node, source) in scripts {
-        let (result, output) = engine.eval_with_output(&source);
+        // Zinc has a known panic in upvalue-closing on deeply-nested
+        // closures (vm.rs:663). On heavy pages (google.com) this
+        // sometimes fires. `catch_unwind` keeps a single bad script
+        // from killing the entire browser; the panicked script's
+        // contribution is dropped and execution continues with the
+        // next `<script>` block.
+        //
+        // `AssertUnwindSafe` is fine here: `engine` is mutable
+        // state we discard right after the loop if anything went
+        // wrong, and the DOM is recovered by the outer style + layout
+        // pass independent of script execution.
+        let result_pair = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.eval_with_output(&source)
+        }));
+        let (result, mut output) = match result_pair {
+            Ok(pair) => pair,
+            Err(_) => (
+                "Error: zinc VM panic during script (skipped)".to_string(),
+                Vec::new(),
+            ),
+        };
+        // Zinc's eval_with_output returns the error message in
+        // `result_str` (prefixed `SyntaxError:` / `CompileError:` /
+        // `Error:`) when a script faults. Surface it as a log line
+        // so the dev-dock Console renders the failure instead of
+        // silently swallowing it.
+        if is_script_error(&result) {
+            output.push(format!("Uncaught {result}"));
+        }
         out.push(ScriptOutcome {
             node,
             source,
@@ -96,7 +132,15 @@ pub fn execute_inline_scripts_with_dom(
         });
     }
     let dirty = dirty_flag.load(Ordering::SeqCst);
-    (out, dirty)
+    let pending_nav = ctx.take_pending_navigation();
+    (out, dirty, pending_nav)
+}
+
+fn is_script_error(result: &str) -> bool {
+    result.starts_with("SyntaxError:")
+        || result.starts_with("CompileError:")
+        || result.starts_with("Error:")
+        || result.starts_with("RuntimeError:")
 }
 
 /// Walk the document for inline `<script>` elements (no `src`) and
