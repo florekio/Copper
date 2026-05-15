@@ -1,0 +1,200 @@
+/* bui user-agent stylesheet (Phase 3 minimal). */
+
+/* Hide elements that the user shouldn't see as page content. The HTML
+   parser preserves their text content in the DOM (so style and title
+   extraction still works), but layout skips them via Display::None. */
+head, title, meta, link, base, style, script, noscript, template { display: none }
+
+html, body { display: block; }
+div, section, article, header, footer, nav, aside, main, figure, figcaption, hgroup, address { display: block; }
+p, pre, blockquote, ul, ol, dl, dd, dt, h1, h2, h3, h4, h5, h6, hr { display: block; }
+details, summary, fieldset, legend { display: block; }
+form, dialog, menu, search, output { display: block; }
+center { display: block; text-align: center; }
+table { display: table; }
+tbody, thead, tfoot, colgroup { display: block; }
+tr { display: table-row; }
+td, th { display: table-cell; padding: 2px 4px; vertical-align: middle; }
+li { display: list-item; }
+caption { display: block; text-align: center }
+
+span, a, em, strong, b, i, u, s, small, big, code, kbd, samp, var, sub, sup, mark, time, abbr, cite, q, dfn { display: inline; }
+img { display: inline-block; }
+br { display: inline; }
+
+body { margin: 8px; color: black; background-color: white; font-family: serif; font-size: 16px; line-height: 1.2 }
+
+h1 { font-size: 32px; font-weight: bold; margin-top: 21px; margin-bottom: 21px }
+h2 { font-size: 24px; font-weight: bold; margin-top: 19px; margin-bottom: 19px }
+h3 { font-size: 19px; font-weight: bold; margin-top: 18px; margin-bottom: 18px }
+h4 { font-size: 16px; font-weight: bold; margin-top: 21px; margin-bottom: 21px }
+h5 { font-size: 13px; font-weight: bold; margin-top: 22px; margin-bottom: 22px }
+h6 { font-size: 11px; font-weight: bold; margin-top: 24px; margin-bottom: 24px }
+
+p { margin-top: 16px; margin-bottom: 16px }
+ul, ol { margin-top: 16px; margin-bottom: 16px; padding-left: 40px }
+ul { list-style-type: disc }
+ol { list-style-type: decimal }
+menu { list-style-type: disc }
+blockquote { margin: 16px 40px }
+pre { white-space: pre; font-family: monospace }
+dl { margin-top: 16px; margin-bottom: 16px }
+dd { margin-left: 40px }
+figure { margin: 16px 40px }
+fieldset { margin: 0 2px; padding: 6px 10px; border: 2px gray }
+legend { padding-left: 2px; padding-right: 2px }
+summary { cursor: pointer; font-weight: bold }
+details:not([open]) > :not(summary) { display: none }
+mark { background-color: yellow; color: black }
+sub { font-size: 75%; vertical-align: sub }
+sup { font-size: 75%; vertical-align: super }
+
+b, strong { font-weight: bold }
+i, em, cite, dfn { font-style: italic }
+small { font-size: 13px }
+s, del, strike { text-decoration: line-through }
+u, ins { text-decoration: underline }
+
+a { color: rgb(0, 0, 238); text-decoration: underline; cursor: pointer }
+a:visited { color: rgb(85, 26, 139) }
+
+hr { display: block; height: 1px; background-color: gray; margin-top: 8px; margin-bottom: 8px }
+
+code, kbd, samp { font-family: monospace }
+
+table { border-color: gray }
+th { font-weight: bold; text-align: center }
+
+/* Form controls. We render <input> and <button> as replaced inline boxes
+   (see bui-layout's InlineControl), so most of the relevant style is
+   pulled directly from ComputedValues at paint time. */
+input { display: inline-block; padding: 2px 4px; border: 1px gray; background-color: white; color: black; font-size: 13px; cursor: text }
+input[type="submit"], input[type="button"], input[type="reset"] { padding: 2px 8px; background-color: rgb(239, 239, 239); text-align: center; cursor: pointer }
+button { display: inline-block; padding: 2px 8px; border: 1px gray; background-color: rgb(239, 239, 239); color: black; font-size: 13px; text-align: center; cursor: pointer }
+select { display: inline-block; padding: 2px 8px; border: 1px gray; background-color: white; color: black; font-size: 13px; cursor: pointer }
+/* Hide raw <option> / <optgroup> content from the document flow —
+   the selected one's text gets rendered by the <select>'s own
+   replaced-control box. */
+option, optgroup, datalist { display: none }
+textarea { display: inline-block; padding: 2px 4px; border: 1px gray; background-color: white; color: black; font-size: 13px; cursor: text }
+
+/* ------------------------------------------------------------------
+   Wikipedia (Vector 2022) overrides
+   ------------------------------------------------------------------ */
+
+/* `.mw-logo-container { float: left }` lives inside a flex item;
+   our flex layout doesn't yet establish a BFC, so the float escapes
+   into the parent BFC and overlaps the search row. Neutralise. */
+.mw-logo-container { float: none !important }
+
+/* Pin the burger to the far left, logo just after it. Both are
+   absolutely positioned to vector-header-start so the flex layout
+   doesn't push them into the search row. The search row starts at
+   x ≈ 236 in vector-header-end; logo's right edge at ~232 leaves
+   a 4-px gap. */
+.vector-main-menu-landmark {
+    position: absolute !important;
+    left: 0 !important;
+    top: 50% !important;
+    transform: translateY(-50%) !important;
+    z-index: 3 !important;
+    width: 44px !important;
+    height: 32px !important;
+}
+.mw-logo {
+    position: absolute !important;
+    left: 32px !important;
+    top: 50% !important;
+    transform: translateY(-50%) !important;
+    z-index: 2 !important;
+    margin: 0 !important;
+    width: 180px !important;
+}
+/* Shrink the wordmark+tagline a little so the logo column fits
+   cleanly between the burger (44 px) and the search row (~236 px). */
+.mw-logo-wordmark { width: 120px !important }
+.mw-logo-tagline  { width: 120px !important }
+.vector-header-start { position: relative !important; z-index: 1 !important }
+
+/* Mask-image icons render as solid dark rectangles because we don't
+   decode CSS masks. Strip the visible payload (background-color +
+   background-image) on every Codex / Vector icon class so they
+   become invisible by default, then re-inject a unicode glyph for
+   the few icons that actually need to read. */
+.vector-icon,
+.cdx-icon,
+.cdx-text-input__icon,
+.cdx-text-input__start-icon,
+.cdx-text-input__end-icon {
+    background-color: transparent !important;
+    background-image: none !important;
+}
+
+/* Hamburger glyph in place of the masked menu icon. Sits at the very
+   left of the header. */
+.mw-ui-icon-menu::before,
+.vector-main-menu-landmark .vector-icon::before {
+    content: "☰";
+    color: #1A1815;
+    font-size: 20px;
+    display: inline-block;
+    width: 20px;
+    line-height: 1;
+    vertical-align: middle;
+}
+/* The label after the hamburger ("Main menu") just clutters the
+   header in our render — Wikipedia hides it via `.cdx-button--icon-only`
+   visibility rules we don't implement. */
+.vector-main-menu-landmark .vector-dropdown-label-text { display: none !important }
+
+/* Search-icon glyph at the left of the input pill. Targets the
+   actual start-icon class Wikipedia ships (not the generic .cdx-icon)
+   so the glyph only appears inside search inputs, not everywhere. */
+.cdx-text-input__start-icon::before {
+    content: "⌕";
+    color: #7A7468;
+    font-size: 15px;
+    display: inline-block;
+    line-height: 1;
+}
+
+/* Flatten the search bar into a single visible pill. Wikipedia
+   stacks an `<input>` inside a `<div class="cdx-text-input">` wrapper;
+   both have their own clip/border/radius which read as TWO boxes
+   without proper composition support. Make the wrapper transparent
+   and let the input own the entire visual. */
+div.cdx-text-input {
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    overflow: visible !important;
+}
+div.cdx-search-input__input-wrapper {
+    background: transparent !important;
+    border: none !important;
+}
+div.cdx-typeahead-search,
+div.vector-typeahead-search-container,
+div.vector-search-box-vue {
+    background: transparent !important;
+    border: none !important;
+}
+input.cdx-text-input__input {
+    height: 32px !important;
+    padding: 0 12px 0 34px !important;
+    border: 1.5px solid #D8D1BF !important;
+    border-radius: 6px !important;
+    background-color: #FFFFFF !important;
+    color: #1A1815 !important;
+    font-size: 14px !important;
+}
+.cdx-search-input__end-button,
+form#searchform button.cdx-button {
+    background-color: #F0EBDE !important;
+    color: #1A1815 !important;
+    border: 1.5px solid #D8D1BF !important;
+    border-radius: 6px !important;
+    padding: 0 14px !important;
+    height: 32px !important;
+    font-size: 13px !important;
+}

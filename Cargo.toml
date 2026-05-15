@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/bui-url",
+    "crates/bui-net",
+    "crates/bui-html",
+    "crates/bui-css",
+    "crates/bui-dom",
+    "crates/bui-style",
+    "crates/bui-layout",
+    "crates/bui-text",
+    "crates/bui-image",
+    "crates/bui-paint",
+    "crates/bui-gpu",
+    "crates/bui-js",
+    "crates/bui-shell",
+    "crates/bui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

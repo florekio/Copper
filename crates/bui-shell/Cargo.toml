@@ -1,0 +1,15 @@
+[package]
+name = "bui-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bui-gpu = { path = "../bui-gpu" }
+bui-paint = { path = "../bui-paint" }
+winit = "0.30"
+pollster = "0.4"
+
+[lints]
+workspace = true

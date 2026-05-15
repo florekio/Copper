@@ -1,0 +1,30 @@
+[package]
+name = "bui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "copper"
+path = "src/main.rs"
+
+[dependencies]
+arboard = { version = "3", default-features = false }
+bui-css = { path = "../bui-css" }
+bui-dom = { path = "../bui-dom" }
+bui-gpu = { path = "../bui-gpu" }
+bui-html = { path = "../bui-html" }
+bui-image = { path = "../bui-image" }
+bui-js = { path = "../bui-js" }
+bui-layout = { path = "../bui-layout" }
+bui-net = { path = "../bui-net" }
+bui-paint = { path = "../bui-paint" }
+bui-shell = { path = "../bui-shell" }
+bui-style = { path = "../bui-style" }
+bui-text = { path = "../bui-text" }
+bui-url = { path = "../bui-url" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+
+[lints]
+workspace = true

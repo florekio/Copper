@@ -1,0 +1,19 @@
+[package]
+name = "bui-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bui-image = { path = "../bui-image" }
+bui-paint = { path = "../bui-paint" }
+bui-text = { path = "../bui-text" }
+wgpu = "28"
+vello = "0.8"
+winit = "0.30"
+pollster = "0.4"
+thiserror = "2"
+
+[lints]
+workspace = true

@@ -1,0 +1,113 @@
+name: release
+
+# Triggered by pushing a `v*` tag (e.g. `git tag v0.1.0 && git push --tags`).
+# Builds release binaries for macOS (Intel + Apple Silicon) and Linux,
+# packages each as a tarball, and attaches them to a GitHub Release.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+            ext: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            ext: ""
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # `bui-js` references zinc via `path = "../../../browser"`.
+      # Clone it as a sibling of the Copper checkout so the workspace
+      # resolves.
+      - name: clone zinc engine
+        run: |
+          git clone --depth=1 https://github.com/florekio/Zinc.git ../browser
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: copper-release-${{ matrix.target }}
+
+      - name: install linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libx11-dev libxkbcommon-dev libxcb1-dev libwayland-dev \
+            pkg-config
+
+      - name: build release binary
+        run: cargo build --release --bin copper --target ${{ matrix.target }}
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="copper-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          cp "target/${{ matrix.target }}/release/copper${{ matrix.ext }}" "dist/${stage}/"
+          cp README.md LICENSE 2>/dev/null || true
+          # LICENSE may live per-crate — pull the workspace one if it exists.
+          if [ -f LICENSE ]; then cp LICENSE "dist/${stage}/"; fi
+          cd dist
+          tar -czf "${stage}.tar.gz" "${stage}"
+          shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copper-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: list artifacts
+        run: ls -la dist/
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Generate release notes from the merged commits since the
+          # previous tag. Maintainers can edit them after-the-fact.
+          generate_release_notes: true
+          # Mark prereleases automatically for tags like v0.1.0-rc1.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

@@ -1,0 +1,17 @@
+[package]
+name = "bui-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bui-css = { path = "../bui-css" }
+bui-dom = { path = "../bui-dom" }
+zinc = { path = "../../../browser" }
+
+[dev-dependencies]
+bui-html = { path = "../bui-html" }
+
+[lints]
+workspace = true

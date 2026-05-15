@@ -1,0 +1,8 @@
+.claude/
+/target
+**/*.rs.bk
+*.swp
+.DS_Store
+.idea/
+.vscode/
+wiki-real.png

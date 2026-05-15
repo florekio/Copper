@@ -1,0 +1,12 @@
+[package]
+name = "bui-html"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bui-dom = { path = "../bui-dom" }
+
+[lints]
+workspace = true

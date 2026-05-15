@@ -1,0 +1,13 @@
+[package]
+name = "bui-style"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bui-css = { path = "../bui-css" }
+bui-dom = { path = "../bui-dom" }
+
+[lints]
+workspace = true
