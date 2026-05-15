@@ -761,15 +761,17 @@ where
 /// every other write-side binding (setAttribute, removeAttribute,
 /// textContent setter, classList add/remove/toggle, removeChild)
 /// works against existing nodes.
+/// Mint a host-tagged Zinc handle from inside a host-fn closure.
+/// Mirrors `Engine::alloc_host_object` but operates on the VM
+/// directly so a `register_host_fn` body can call it. Used by
+/// `__docCreateElement` / `__docCreateTextNode` so JS-side
+/// `document.createElement(...)` returns a real handle.
 fn engine_alloc_host_object_via_vm(
-    _vm: &mut zinc::vm::vm::Vm,
-    _tag: HostTag,
-    _payload: u64,
+    vm: &mut zinc::vm::vm::Vm,
+    tag: HostTag,
+    payload: u64,
 ) -> Value {
-    // Zinc patch pending: enable the next line once
-    // `Vm::alloc_host_object` lands in /Users/florianstein/Desktop/browser:
-    //   _vm.alloc_host_object(_tag.0, _payload)
-    Value::null()
+    vm.alloc_host_object(tag.0, payload)
 }
 
 fn read_str(vm: &zinc::vm::vm::Vm, val: Option<&Value>) -> Option<String> {
@@ -1184,13 +1186,12 @@ mod tests {
         assert_eq!(after, "fresh");
     }
 
-    // Gated on the pending Zinc `Vm::alloc_host_object` patch — the
-    // stub in engine_alloc_host_object_via_vm currently returns
-    // Value::null(), so createElement returns null and the script
-    // throws on `p.textContent =`. Re-enable (drop the `#[ignore]`)
-    // once the engine patch lands locally.
+    // Exercises `Vm::alloc_host_object` (Phase 2 of the JS-engine
+    // milestone, browser repo commit 4d09502): `document.createElement`
+    // mints a fresh handle, the script writes into it, the host
+    // appends it under `document.body`, and the change is visible
+    // when the embedder inspects the DOM after eval.
     #[test]
-    #[ignore]
     fn create_element_then_append_adds_to_dom() {
         let mut engine = Engine::new();
         let doc = wrapped_doc("<body></body>");
