@@ -202,7 +202,50 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 fn shared_client() -> &'static Client {
-    SHARED_CLIENT.get_or_init(Client::new)
+    SHARED_CLIENT.get_or_init(|| {
+        let client = Client::new();
+        seed_google_consent(&client);
+        client
+    })
+}
+
+/// Pre-seed the cookie jar with Google's consent cookies so the
+/// modern consent gate (`https://consent.google.com/ml?...`) is
+/// skipped entirely.
+///
+/// Why this is necessary: when a user types a query on the
+/// google.com homepage and presses Enter, our chrome submits the
+/// form as a `GET` to `/search?q=…`. Without a CONSENT cookie
+/// Google's edge replies with a 302 to a consent page whose
+/// "Accept" form is POST-only. Our chrome only knows how to
+/// submit `GET` forms today, so the user clicks Accept and lands
+/// on `/save?...` via GET, which returns HTTP 405 "Method Not
+/// Allowed". Seeding the cookies bypasses that flow — every
+/// /search request from here on lands directly on the (`gbv=1`)
+/// basic-HTML results page.
+///
+/// The two cookie names + value shapes are what real Chrome /
+/// Firefox set after the user accepts. The expiry is a far-future
+/// date so we don't need to refresh; the path is `/` and the
+/// domain is `.google.com` so every subdomain inherits.
+fn seed_google_consent(client: &Client) {
+    let url = match Url::parse("https://www.google.com/") {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let jar = client.jar();
+    if let Ok(mut jar) = jar.lock() {
+        jar.store(
+            "CONSENT=YES+cb.20210720-07-p0.en+FX+667; \
+             Domain=.google.com; Path=/; Expires=Thu, 31 Dec 2099 23:59:59 GMT",
+            &url,
+        );
+        jar.store(
+            "SOCS=CAESHAgBEhJnd3NfMjAyMzA0MTQtMF9SQzIaAmRlIAEaBgiAuPaiBg; \
+             Domain=.google.com; Path=/; Expires=Thu, 31 Dec 2099 23:59:59 GMT",
+            &url,
+        );
+    }
 }
 
 // ---- non-window modes ----
@@ -579,14 +622,20 @@ fn is_google_search_host(host: &str) -> bool {
         })
 }
 
-/// Pages that ship a full HTML view only via a non-default URL
-/// parameter need a redirect at the fetcher to land on something
-/// usable. Google's `/search` is the textbook case: the default
-/// shell is JS-only (every <table>/<div>/<span>/<p> is hidden by
-/// a noscript stylesheet, plus a meta-refresh to a JS retry
-/// endpoint that 405s for non-JS clients), but `&gbv=1` returns a
-/// fully static "basic HTML" version that shows real result links.
-/// We rewrite once, here, before the request is dispatched.
+/// A search engine submission needs an HTML-only endpoint to land
+/// somewhere useful in a JS-less browser. Google's `/search` used
+/// to serve a static "basic HTML" version via `?gbv=1`, but as of
+/// 2024+ that path returns a `<noscript><meta refresh>` trap
+/// pointing at `/httpservice/retry/enablejs` regardless of cookies
+/// or User-Agent. The consent flow on top (POST-only form, our
+/// chrome only submits GET) compounds the problem with a 405.
+///
+/// Until we have real JS, we redirect every Google `/search` to
+/// **DuckDuckGo's `/html/` endpoint**, which still serves real
+/// server-rendered results — `<a class="result__a" href="…">`
+/// links the rest of the chrome can follow. Same `q=` parameter,
+/// same submission ergonomics from the user's side. The dev-dock
+/// Console picks up the redirect via the URL change.
 fn maybe_rewrite_google_search(url: &Url) -> Url {
     if !is_google_search_host(&url.host) {
         return url.clone();
@@ -594,18 +643,22 @@ fn maybe_rewrite_google_search(url: &Url) -> Url {
     if !url.path.starts_with("/search") {
         return url.clone();
     }
-    let q = url.query.clone().unwrap_or_default();
-    if q.split('&').any(|p| p == "gbv=1" || p.starts_with("gbv=")) {
+    // Extract the user's query (`q=…`). If we can't find it just
+    // leave the URL alone — better to land on Google's error than
+    // to send the user to a query-less DDG.
+    let q = url.query.as_deref().and_then(|qs| {
+        qs.split('&').find_map(|p| p.strip_prefix("q="))
+    });
+    let Some(q) = q else { return url.clone() };
+    if q.is_empty() {
         return url.clone();
     }
-    let new_q = if q.is_empty() {
-        "gbv=1".to_string()
-    } else {
-        format!("{q}&gbv=1")
+    let Ok(ddg_base) = Url::parse("https://duckduckgo.com/html/") else {
+        return url.clone();
     };
-    let mut next = url.clone();
-    next.query = Some(new_q);
-    next
+    let mut ddg = ddg_base;
+    ddg.query = Some(format!("q={q}"));
+    ddg
 }
 
 /// Fetch a CSS URL, parse it, and inline any `@import` rules in
@@ -4194,25 +4247,42 @@ mod tests {
     }
 
     #[test]
-    fn google_search_rewrite_matches_locale_domains() {
-        // The bug we're regression-testing: pre-fix, only google.com
-        // and www.google.com triggered the gbv=1 rewrite, so users
-        // on google.de (and every other ccTLD) were served Google's
-        // JS-required search shell, which returns 405 for non-JS
-        // clients.
+    fn google_search_redirects_to_ddg_html() {
+        // Google's modern /search rejects every non-JS client even
+        // with the legacy `gbv=1` flag (the body is a noscript meta-
+        // refresh to /httpservice/retry/enablejs that 405s). We
+        // redirect /search?q=X to DuckDuckGo's HTML endpoint, which
+        // still serves real server-rendered result links.
         fn rw(s: &str) -> String {
             let u = Url::parse(s).unwrap();
             maybe_rewrite_google_search(&u).to_string()
         }
-        // Apex + www on .com (already worked before — make sure we
-        // didn't regress it).
-        assert!(rw("https://google.com/search?q=x").ends_with("?q=x&gbv=1"));
-        assert!(rw("https://www.google.com/search?q=x").ends_with("?q=x&gbv=1"));
-        // The actual fix: locale ccTLDs.
-        assert!(rw("https://www.google.de/search?q=x").ends_with("?q=x&gbv=1"));
-        assert!(rw("https://google.fr/search?q=x").ends_with("?q=x&gbv=1"));
-        assert!(rw("https://www.google.co.uk/search?q=x").ends_with("?q=x&gbv=1"));
-        assert!(rw("https://google.com.br/search?q=x").ends_with("?q=x&gbv=1"));
+        // Apex + www on .com.
+        assert_eq!(
+            rw("https://google.com/search?q=x"),
+            "https://duckduckgo.com/html/?q=x",
+        );
+        assert_eq!(
+            rw("https://www.google.com/search?q=x"),
+            "https://duckduckgo.com/html/?q=x",
+        );
+        // Locale ccTLDs all route through the same fallback.
+        assert_eq!(
+            rw("https://www.google.de/search?q=x"),
+            "https://duckduckgo.com/html/?q=x",
+        );
+        assert_eq!(
+            rw("https://google.fr/search?q=x"),
+            "https://duckduckgo.com/html/?q=x",
+        );
+        assert_eq!(
+            rw("https://www.google.co.uk/search?q=x"),
+            "https://duckduckgo.com/html/?q=x",
+        );
+        assert_eq!(
+            rw("https://google.com.br/search?q=x"),
+            "https://duckduckgo.com/html/?q=x",
+        );
         // Subdomained Google products are NOT search.
         assert_eq!(
             rw("https://scholar.google.com/search?q=x"),
@@ -4232,10 +4302,11 @@ mod tests {
             rw("https://google.de/maps?q=x"),
             "https://google.de/maps?q=x",
         );
-        // Idempotent: already has gbv=1 → unchanged.
+        // No q parameter — leave alone (the homepage submit always
+        // includes one).
         assert_eq!(
-            rw("https://google.de/search?q=x&gbv=1"),
-            "https://google.de/search?q=x&gbv=1",
+            rw("https://google.com/search"),
+            "https://google.com/search",
         );
     }
 
