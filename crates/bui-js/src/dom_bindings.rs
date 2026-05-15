@@ -97,6 +97,13 @@ pub struct BindingContext {
     /// `location.assign(...)` / `location.replace(...)`). Drained
     /// once by the embedder after the script pass completes.
     pending_navigation: Arc<Mutex<Option<String>>>,
+    /// Listener registry. Scripts add entries via the
+    /// `__addEventListener` host fn; embedder code dispatches by
+    /// constructing an `Event` and calling `dispatch_js` with the
+    /// engine's `Vm`. Per-NodeId / per-event-type. Empty by default
+    /// — addEventListener only ever inserts, never removes (a
+    /// `__removeEventListener` follow-up rounds out the surface).
+    listeners: Arc<Mutex<crate::events::EventListenerMap>>,
 }
 
 impl BindingContext {
@@ -680,10 +687,60 @@ impl BindingContext {
             Ok(Value::null())
         });
 
+        // ---- Event listener registration ----
+        //
+        // `__addEventListener(targetHandle, type, listener,
+        // capture)` records the JS callable into a shared
+        // EventListenerMap keyed by (NodeId, type, capture). The
+        // embedder fires events via dispatch_js when user input
+        // arrives. `targetHandle === null` registers on the
+        // document root (the common pattern Google's
+        // `document.documentElement.addEventListener(...)` uses).
+        let listeners: Arc<Mutex<crate::events::EventListenerMap>> =
+            Arc::new(Mutex::new(crate::events::EventListenerMap::default()));
+        let listeners_for_fn = listeners.clone();
+        let shared_for_listener = shared.clone();
+        engine.register_host_fn("__addEventListener", move |vm, _this, args| {
+            let Some(kind) = read_str(vm, args.get(1)) else {
+                return Ok(Value::null());
+            };
+            let Some(listener) = args.get(2).copied() else {
+                return Ok(Value::null());
+            };
+            let capture = args
+                .get(3)
+                .map(|v| v.as_bool().unwrap_or(false))
+                .unwrap_or(false);
+            // Resolve target handle → NodeId. A null handle (when JS
+            // calls `document.addEventListener(...)`) or unknown
+            // handle routes to the document root so capture-phase
+            // listeners on documentElement still fire.
+            let target_node = match args.first().copied() {
+                Some(h) if h.is_null() || h.is_undefined() => {
+                    shared_for_listener.lock().unwrap().doc_handle.lock().unwrap().root
+                }
+                Some(h) => match shared_for_listener.lock().unwrap().node_for_handle(h) {
+                    Some(nid) => nid,
+                    None => shared_for_listener.lock().unwrap().doc_handle.lock().unwrap().root,
+                },
+                None => shared_for_listener.lock().unwrap().doc_handle.lock().unwrap().root,
+            };
+            if let Ok(mut map) = listeners_for_fn.lock() {
+                map.add_js(target_node, &kind, capture, listener);
+            }
+            Ok(Value::null())
+        });
+
         // ---- JS prelude wrapping the `__` host fns ----
         let _ = engine.eval(PRELUDE);
 
-        BindingContext { shared, elem_tag, dirty, pending_navigation }
+        BindingContext {
+            shared,
+            elem_tag,
+            dirty,
+            pending_navigation,
+            listeners,
+        }
     }
 
     /// Number of allocated host handles. After mutations, this is
@@ -712,6 +769,15 @@ impl BindingContext {
     /// this once after the script pass completes.
     pub fn take_pending_navigation(&self) -> Option<String> {
         self.pending_navigation.lock().ok()?.take()
+    }
+
+    /// Shared listener map populated by `__addEventListener` calls.
+    /// The embedder dispatches user-input events into this map via
+    /// `EventListenerMap::dispatch_js`. Held as an `Arc<Mutex<…>>`
+    /// so it can outlive the BindingContext if the embedder wants
+    /// to fire events after the script pass returns.
+    pub fn listeners(&self) -> Arc<Mutex<crate::events::EventListenerMap>> {
+        self.listeners.clone()
     }
 }
 
@@ -898,10 +964,19 @@ var document = {
     }
 };
 function __noop() {}
-document.addEventListener = __noop;
+// addEventListener wrapper — routes through the __addEventListener
+// host fn with the right target handle. `null` resolves to the
+// document root on the host side (so document.addEventListener and
+// documentElement.addEventListener both land on the same node,
+// matching real-browser semantics closely enough for capture-phase
+// hooks).
+function __ael(type, listener, capture) {
+    __addEventListener(null, type, listener, capture === true);
+}
+document.addEventListener = __ael;
 document.removeEventListener = __noop;
 document.documentElement = {
-    addEventListener: __noop,
+    addEventListener: __ael,
     removeEventListener: __noop
 };
 var location = { href: '', assign: __navigate, replace: __navigate, reload: __noop };
@@ -916,7 +991,7 @@ var window = {
     setTimeout: __noop,
     clearTimeout: __noop,
     requestAnimationFrame: __noop,
-    addEventListener: __noop,
+    addEventListener: __ael,
     removeEventListener: __noop,
     innerWidth: 1400,
     innerHeight: 900
