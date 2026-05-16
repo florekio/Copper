@@ -36,12 +36,14 @@
 //! finish to decide whether the layout pipeline needs to re-run.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bui_dom::{Document, NodeId, NodeKind};
 use zinc::engine::{Engine, HostTag};
 use zinc::runtime::value::Value;
+
+use crate::events::{EVT_FLAG_DEFAULT_PREVENTED, EVT_FLAG_STOP_PROPAGATION};
 
 /// Inner shared state held by every binding closure.
 struct DomShared {
@@ -121,6 +123,18 @@ pub struct BindingContext {
     /// — addEventListener only ever inserts, never removes (a
     /// `__removeEventListener` follow-up rounds out the surface).
     listeners: Arc<Mutex<crate::events::EventListenerMap>>,
+    /// Bit-set of `EVT_FLAG_*` raised by the currently-dispatching
+    /// JS event. The `preventDefault` / `stopPropagation`
+    /// host fns ORed into this; `EventListenerMap::dispatch_js`
+    /// snapshots + clears it across a dispatch.
+    event_flags: Arc<AtomicU32>,
+    /// JS Value of the global `__eventPreventDefault` host fn,
+    /// cached after install so `build_js_event` can hand it
+    /// out as `event.preventDefault` without a per-dispatch
+    /// global lookup.
+    prevent_default_fn: Value,
+    /// JS Value of the global `__eventStopPropagation` host fn.
+    stop_propagation_fn: Value,
 }
 
 impl BindingContext {
@@ -798,8 +812,41 @@ impl BindingContext {
             Ok(obj)
         });
 
+        // ---- Event flag mutators ----
+        //
+        // `__eventPreventDefault` / `__eventStopPropagation` flip
+        // bits on the shared atomic. Each JS Event object's
+        // `preventDefault` / `stopPropagation` properties are
+        // bound to these (resolved as globals after registration)
+        // by `build_js_event` so a handler calling
+        // `e.preventDefault()` lands here, OR-s the bit, and the
+        // post-dispatch fold sets `Event.flags.default_prevented`
+        // so the host can suppress its default action.
+        let event_flags: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let flags_for_pd = event_flags.clone();
+        engine.register_host_fn("__eventPreventDefault", move |_vm, _this, _args| {
+            flags_for_pd.fetch_or(EVT_FLAG_DEFAULT_PREVENTED, Ordering::SeqCst);
+            Ok(Value::null())
+        });
+        let flags_for_sp = event_flags.clone();
+        engine.register_host_fn("__eventStopPropagation", move |_vm, _this, _args| {
+            flags_for_sp.fetch_or(EVT_FLAG_STOP_PROPAGATION, Ordering::SeqCst);
+            Ok(Value::null())
+        });
+
         // ---- JS prelude wrapping the `__` host fns ----
         let _ = engine.eval(PRELUDE);
+
+        // Resolve the host-fn callables to JS Values once, after
+        // both registration and prelude eval, so we can hand them
+        // out as `event.preventDefault` / `event.stopPropagation`
+        // without a per-dispatch global lookup.
+        let prevent_default_fn = engine
+            .eval("__eventPreventDefault")
+            .unwrap_or(Value::null());
+        let stop_propagation_fn = engine
+            .eval("__eventStopPropagation")
+            .unwrap_or(Value::null());
 
         BindingContext {
             shared,
@@ -807,6 +854,9 @@ impl BindingContext {
             dirty,
             pending_navigation,
             listeners,
+            event_flags,
+            prevent_default_fn,
+            stop_propagation_fn,
         }
     }
 
@@ -845,6 +895,29 @@ impl BindingContext {
     /// to fire events after the script pass returns.
     pub fn listeners(&self) -> Arc<Mutex<crate::events::EventListenerMap>> {
         self.listeners.clone()
+    }
+
+    /// Host handle Value registered for `nid`, if any. Used to set
+    /// `event.target` on dispatched events so JS handlers see a
+    /// real host object instead of `null`.
+    pub fn handle_for_node(&self, nid: NodeId) -> Option<Value> {
+        self.shared.lock().ok()?.handle_for(nid)
+    }
+
+    /// Build a fresh `EventDispatchCtx` for one dispatch — the
+    /// shared atomic + cached preventDefault / stopPropagation
+    /// callables + an optional target handle. The caller passes
+    /// this to `EventListenerMap::dispatch_js`.
+    pub fn event_dispatch_ctx(
+        &self,
+        target_handle: Option<Value>,
+    ) -> crate::events::EventDispatchCtx {
+        crate::events::EventDispatchCtx {
+            event_flags: self.event_flags.clone(),
+            prevent_default_fn: self.prevent_default_fn,
+            stop_propagation_fn: self.stop_propagation_fn,
+            target_handle,
+        }
     }
 }
 
@@ -1004,7 +1077,20 @@ function _wrapElem(handle) {
             if (child === null || child === undefined) return null;
             __elemRemoveChild(this._h, child._h);
             return child;
-        }
+        },
+        // Element-level event registration. `event.target` /
+        // `event.currentTarget` arrive as the raw host handle
+        // from Rust; we re-wrap them here so user code can
+        // call `e.target.getAttribute(...)` etc. as usual.
+        addEventListener: function(type, listener, capture) {
+            var h = this._h;
+            __addEventListener(h, type, function(e) {
+                e.target = _wrapElem(e.target);
+                e.currentTarget = _wrapElem(e.currentTarget);
+                listener(e);
+            }, capture === true);
+        },
+        removeEventListener: __noop
     };
 }
 var document = {
@@ -1060,7 +1146,11 @@ function queueMicrotask(fn) {
 // matching real-browser semantics closely enough for capture-phase
 // hooks).
 function __ael(type, listener, capture) {
-    __addEventListener(null, type, listener, capture === true);
+    __addEventListener(null, type, function(e) {
+        e.target = _wrapElem(e.target);
+        e.currentTarget = _wrapElem(e.currentTarget);
+        listener(e);
+    }, capture === true);
 }
 // Synchronous fetch wrapper. __fetch_sync blocks on the embedder
 // fetcher and returns { ok, status, url, body }. We layer the
@@ -1120,7 +1210,13 @@ document.documentElement = {
     addEventListener: __ael,
     removeEventListener: __noop
 };
-var location = { href: '', assign: __navigate, replace: __navigate, reload: __noop };
+var location = {
+    get href() { return __current_url(); },
+    set href(v) { __navigate(v); },
+    assign: __navigate,
+    replace: __navigate,
+    reload: __noop
+};
 var navigator = { userAgent: 'bui/0.1', language: 'en-US' };
 var history = { length: 1, state: null, pushState: __noop, replaceState: __noop, back: __noop, forward: __noop, go: __noop };
 var window = {

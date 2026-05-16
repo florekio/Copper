@@ -24,6 +24,7 @@ pub mod dom_bindings;
 pub mod events;
 
 pub use dom_bindings::{BindingContext, FetchResponse, Fetcher};
+pub use events::Event;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -89,65 +90,122 @@ pub fn execute_inline_scripts_with_dom(
 /// synchronous fetcher that backs the JS-side `fetch(url)`.
 /// Without one, inline scripts that call `fetch` get a Response
 /// shape whose `.ok` is `false` and body is empty.
+///
+/// Thin wrapper around [`JsContext::install_and_run`] for callers
+/// who don't need to keep the engine alive past the script pass.
+/// New code should prefer `JsContext` directly so user-input
+/// dispatches can reuse the engine the page set up.
 pub fn execute_inline_scripts_with_dom_and_fetcher(
     doc: Arc<Mutex<Document>>,
     current_url: String,
     fetcher: Option<Fetcher>,
 ) -> (Vec<ScriptOutcome>, bool, Option<String>) {
-    // Collect script sources up front. We hold the doc lock only
-    // for the walk so install + eval can take it themselves.
-    let scripts = {
-        let d = doc.lock().unwrap();
-        collect_inline_scripts(&d)
-    };
-
-    let mut engine = Engine::new();
-    // Keep a clone of the doc arc so we can fire a synthetic `load`
-    // event below, after the script pass has finished registering
-    // listeners. (BindingContext owns the arc internally for
-    // every host fn that needs it; we need a reference too.)
-    let doc_for_load = doc.clone();
-    let ctx = BindingContext::install_with_fetcher(&mut engine, doc, current_url, fetcher);
-    let dirty_flag = ctx.dirty();
-    let listeners = ctx.listeners();
-
-    let mut out = Vec::with_capacity(scripts.len());
-    for (node, source) in scripts {
-        let (result, mut output) = engine.eval_with_output(&source);
-        // Zinc's eval_with_output returns the error message in
-        // `result_str` (prefixed `SyntaxError:` / `CompileError:` /
-        // `Error:`) when a script faults. Surface it as a log line
-        // so the dev-dock Console renders the failure instead of
-        // silently swallowing it.
-        if is_script_error(&result) {
-            output.push(format!("Uncaught {result}"));
-        }
-        out.push(ScriptOutcome {
-            node,
-            source,
-            result,
-            output,
-        });
-    }
-
-    // Fire a synthetic `load` event before tearing down the
-    // engine. Inline scripts that registered `window
-    // .addEventListener('load', …)` (or document/documentElement
-    // equivalents) get one fan-out opportunity before user-input
-    // dispatch is wired through TabState in a future phase. Any
-    // pending navigation the handler set via `location.href =
-    // …` is picked up by the same take_pending_navigation below.
-    {
-        let dlocked = doc_for_load.lock().unwrap();
-        let root = dlocked.root;
-        let mut map = listeners.lock().unwrap();
-        let event = crate::events::Event::new("load", root);
-        let _ = map.dispatch_js(&dlocked, event, engine.vm());
-    }
-
-    let dirty = dirty_flag.load(Ordering::SeqCst);
+    let (mut ctx, outcomes) = JsContext::install_and_run(doc, current_url, fetcher);
+    let dirty = ctx.take_dirty();
     let pending_nav = ctx.take_pending_navigation();
-    (out, dirty, pending_nav)
+    (outcomes, dirty, pending_nav)
+}
+
+/// Persistent JS context for one page load. Owns the `Engine`, the
+/// `BindingContext`, and the shared state (dirty flag, pending
+/// navigation, listener map) used by both the initial script pass
+/// and any post-load event dispatch the embedder fires.
+///
+/// One `JsContext` per `TabState` — torn down when the tab
+/// navigates to a new URL. While it's alive, user-input handlers
+/// can keep firing `submit` / `click` / `keydown` events into the
+/// same listener map the inline scripts registered against, and
+/// the engine's globals (closures, captured state) persist across
+/// every dispatch.
+pub struct JsContext {
+    engine: Engine,
+    bindings: BindingContext,
+    /// Arc-clone of the document the bindings were installed
+    /// against. The embedder hands the same Arc into this struct
+    /// AND keeps a clone on `TabState`; both see the same DOM.
+    doc: Arc<Mutex<Document>>,
+}
+
+impl JsContext {
+    /// Install the binding surface, run every inline `<script>`
+    /// in document order, and fire one synthetic `load` event
+    /// once the script pass finishes registering listeners.
+    /// Returns the live context for further user-input
+    /// dispatches plus the per-script outcomes (so the dev-dock
+    /// Console can render them).
+    pub fn install_and_run(
+        doc: Arc<Mutex<Document>>,
+        current_url: String,
+        fetcher: Option<Fetcher>,
+    ) -> (Self, Vec<ScriptOutcome>) {
+        let scripts = {
+            let d = doc.lock().unwrap();
+            collect_inline_scripts(&d)
+        };
+
+        let mut engine = Engine::new();
+        let bindings = BindingContext::install_with_fetcher(
+            &mut engine,
+            doc.clone(),
+            current_url,
+            fetcher,
+        );
+
+        let mut outcomes = Vec::with_capacity(scripts.len());
+        for (node, source) in scripts {
+            let (result, mut output) = engine.eval_with_output(&source);
+            if is_script_error(&result) {
+                output.push(format!("Uncaught {result}"));
+            }
+            outcomes.push(ScriptOutcome {
+                node,
+                source,
+                result,
+                output,
+            });
+        }
+
+        let mut ctx = JsContext {
+            engine,
+            bindings,
+            doc,
+        };
+        // Synthetic `load` event so handlers registered via
+        // `window.addEventListener('load', …)` get one fan-out
+        // opportunity right after the script pass.
+        let root = ctx.doc.lock().unwrap().root;
+        let _ = ctx.dispatch(Event::new("load", root));
+        (ctx, outcomes)
+    }
+
+    /// Dispatch a synthetic event through the registered JS
+    /// listeners. Returns the post-dispatch event with
+    /// `flags.default_prevented` / `flags.stop_propagation`
+    /// folded in so the caller can suppress its default action.
+    pub fn dispatch(&mut self, event: Event) -> Event {
+        let target = event.target;
+        let dispatch_ctx = self
+            .bindings
+            .event_dispatch_ctx(self.bindings.handle_for_node(target));
+        let listeners = self.bindings.listeners();
+        let dlocked = self.doc.lock().unwrap();
+        let mut map = listeners.lock().unwrap();
+        map.dispatch_js(&dlocked, event, self.engine.vm(), &dispatch_ctx)
+    }
+
+    /// Drain the URL JS asked us to navigate to. Returns `None`
+    /// if no script / handler set it since the last drain.
+    pub fn take_pending_navigation(&self) -> Option<String> {
+        self.bindings.take_pending_navigation()
+    }
+
+    /// Read + clear the dirty flag. The orchestrator polls this
+    /// after every dispatch to decide whether to re-style + re-
+    /// layout before the next paint.
+    pub fn take_dirty(&mut self) -> bool {
+        let flag = self.bindings.dirty();
+        flag.swap(false, Ordering::SeqCst)
+    }
 }
 
 fn is_script_error(result: &str) -> bool {
@@ -328,5 +386,98 @@ mod tests {
             .eval("nodeAt(0) === nodeAt(0)")
             .expect("eval succeeds");
         assert_eq!(same.as_bool(), Some(true));
+    }
+
+    /// Wire-level integration test for Phase 6 user-input dispatch:
+    /// a page registers a `submit` listener on `document` during
+    /// the inline script pass; later, the embedder fires a `submit`
+    /// event on a form node via `JsContext::dispatch`. The event
+    /// bubbles up to the document handler, which calls
+    /// `preventDefault()` so the chrome suppresses its default
+    /// navigate, and calls `location.assign(...)` so the chrome
+    /// navigates to a JS-built URL instead.
+    #[test]
+    fn js_context_dispatches_submit_after_script_pass() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let form = d.create_element("form");
+        d.element_mut(form).unwrap().set_attr("id", "f");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "var fired = 0;\n\
+             document.addEventListener('submit', function(e){\n\
+                fired = fired + 1;\n\
+                e.preventDefault();\n\
+                location.assign('/from-js');\n\
+             });",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, form);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        // No pending nav from the load event itself — the listener
+        // is registered but not yet fired.
+        assert!(ctx.take_pending_navigation().is_none());
+
+        // Fire the synthetic submit at the form node — it bubbles
+        // up to the document handler.
+        let event = ctx.dispatch(Event::new("submit", form));
+        assert!(
+            event.flags.default_prevented,
+            "handler called preventDefault, flag should fold back to Rust"
+        );
+
+        // Handler also called location.assign — drains as pending nav.
+        let next = ctx
+            .take_pending_navigation()
+            .expect("handler called location.assign");
+        assert_eq!(next, "/from-js");
+
+        // And we observe the side-effect of the handler running.
+        let (fired, _) = ctx.engine.eval_with_output("fired");
+        assert_eq!(fired, "1");
+    }
+
+    /// Same shape as the document-level test above, but the
+    /// listener is registered on the form element via the
+    /// element-level `addEventListener` (the more common
+    /// pattern in modern code). Locks in that
+    /// `_wrapElem.addEventListener` routes through the host fn
+    /// with the right target handle.
+    #[test]
+    fn element_level_add_event_listener_fires_on_target() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let form = d.create_element("form");
+        d.element_mut(form).unwrap().set_attr("id", "f");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "var fired = 0;\n\
+             var f = document.getElementById('f');\n\
+             f.addEventListener('submit', function(e){\n\
+                fired = fired + 1;\n\
+                e.preventDefault();\n\
+             });",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, form);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        let event = ctx.dispatch(Event::new("submit", form));
+        assert!(event.flags.default_prevented);
+        let (fired, _) = ctx.engine.eval_with_output("fired");
+        assert_eq!(fired, "1");
     }
 }

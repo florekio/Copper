@@ -17,10 +17,34 @@
 //!     `data` map; the JS-side `Event` object surfaces just those.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bui_dom::{Document, NodeId};
 use zinc::runtime::value::Value;
 use zinc::vm::vm::Vm;
+
+/// Per-dispatch context plumbed from the embedder. Carries the
+/// pre-allocated callables backing `event.preventDefault()` /
+/// `event.stopPropagation()` so the JS handler can flip
+/// Rust-side flags via host_fn, plus the host handle to set
+/// as `event.target` (when one is registered for the target
+/// NodeId), and the shared atomic the host fns mutate.
+///
+/// One atomic per `JsContext` is reused across dispatches — we
+/// store the previous value, reset to zero, run the dispatch,
+/// fold the resulting flags into the `Event`, then restore the
+/// previous value. Re-entrant dispatches stay correct as long
+/// as they don't share an event (they don't).
+pub struct EventDispatchCtx {
+    pub event_flags: Arc<AtomicU32>,
+    pub prevent_default_fn: Value,
+    pub stop_propagation_fn: Value,
+    pub target_handle: Option<Value>,
+}
+
+pub const EVT_FLAG_DEFAULT_PREVENTED: u32 = 1;
+pub const EVT_FLAG_STOP_PROPAGATION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -125,16 +149,37 @@ impl EventListenerMap {
     /// in the same entry are skipped because a VM isn't available.
     /// Used by tests and any host code without engine access.
     pub fn dispatch(&mut self, doc: &Document, event: Event) -> Event {
-        self.dispatch_inner(doc, event, None)
+        self.dispatch_inner(doc, event, None, None)
     }
 
     /// Dispatch firing every listener — Rust-side and JS-side.
-    /// The VM is used to call each `Listener::Js` value with a
-    /// synthetic event object as its single argument. Any thrown
-    /// JS exception is swallowed (dev-dock Console will see it
-    /// in a follow-up that threads error reporting through here).
-    pub fn dispatch_js(&mut self, doc: &Document, event: Event, vm: &mut Vm) -> Event {
-        self.dispatch_inner(doc, event, Some(vm))
+    /// The VM calls each `Listener::Js` value with a synthetic
+    /// event object as its single argument. `ctx` provides the
+    /// preventDefault / stopPropagation callables (bound to the
+    /// shared atomic) plus the host handle to surface as
+    /// `event.target`. Any thrown JS exception is swallowed (the
+    /// dev-dock Console will pick it up in a follow-up that
+    /// threads error reporting through here).
+    pub fn dispatch_js(
+        &mut self,
+        doc: &Document,
+        event: Event,
+        vm: &mut Vm,
+        ctx: &EventDispatchCtx,
+    ) -> Event {
+        // Snapshot + reset the shared atomic so a re-entrant
+        // dispatch (a JS listener doing `el.dispatchEvent(...)`,
+        // not yet wired) can't leak prior flag bits into ours.
+        let prev = ctx.event_flags.swap(0, Ordering::SeqCst);
+        let mut out = self.dispatch_inner(doc, event, Some(vm), Some(ctx));
+        let raised = ctx.event_flags.swap(prev, Ordering::SeqCst);
+        if raised & EVT_FLAG_DEFAULT_PREVENTED != 0 {
+            out.flags.default_prevented = true;
+        }
+        if raised & EVT_FLAG_STOP_PROPAGATION != 0 {
+            out.flags.stop_propagation = true;
+        }
+        out
     }
 
     fn dispatch_inner(
@@ -142,6 +187,7 @@ impl EventListenerMap {
         doc: &Document,
         mut event: Event,
         vm: Option<&mut Vm>,
+        ctx: Option<&EventDispatchCtx>,
     ) -> Event {
         // Build path from target up to root (inclusive).
         let mut path: Vec<NodeId> = Vec::new();
@@ -160,19 +206,23 @@ impl EventListenerMap {
         event.phase = Phase::Capturing;
         for &node in path.iter().rev().take(path.len().saturating_sub(1)) {
             event.current_target = node;
-            self.invoke(node, true, &mut event, &mut vm_slot);
-            if event.flags.stop_propagation {
+            self.invoke(node, true, &mut event, &mut vm_slot, ctx);
+            // Both Rust-side (event.flags) and JS-side (ctx
+            // atomic) stop_propagation halt the walk.
+            if event.flags.stop_propagation || ctx_stopped(ctx) {
+                fold_atomic(ctx, &mut event);
                 return event;
             }
         }
         // At target: both capture (true) and bubble (false) listeners fire.
         event.phase = Phase::AtTarget;
         event.current_target = event.target;
-        self.invoke(event.target, true, &mut event, &mut vm_slot);
+        self.invoke(event.target, true, &mut event, &mut vm_slot, ctx);
         if !event.flags.stop_immediate {
-            self.invoke(event.target, false, &mut event, &mut vm_slot);
+            self.invoke(event.target, false, &mut event, &mut vm_slot, ctx);
         }
-        if event.flags.stop_propagation {
+        if event.flags.stop_propagation || ctx_stopped(ctx) {
+            fold_atomic(ctx, &mut event);
             return event;
         }
         // Bubble phase, only if event bubbles.
@@ -180,13 +230,14 @@ impl EventListenerMap {
             event.phase = Phase::Bubbling;
             for &node in path.iter().skip(1) {
                 event.current_target = node;
-                self.invoke(node, false, &mut event, &mut vm_slot);
-                if event.flags.stop_propagation {
+                self.invoke(node, false, &mut event, &mut vm_slot, ctx);
+                if event.flags.stop_propagation || ctx_stopped(ctx) {
                     break;
                 }
             }
         }
         event.phase = Phase::None;
+        fold_atomic(ctx, &mut event);
         event
     }
 
@@ -196,6 +247,7 @@ impl EventListenerMap {
         capture: bool,
         event: &mut Event,
         vm: &mut Option<&mut Vm>,
+        ctx: Option<&EventDispatchCtx>,
     ) {
         let key = (node, event.kind.clone(), capture);
         let Some(list) = self.entries.get_mut(&key) else { return };
@@ -204,7 +256,7 @@ impl EventListenerMap {
                 Listener::Rust(f) => f(event),
                 Listener::Js(callable) => {
                     if let Some(vm_ref) = vm.as_deref_mut() {
-                        let event_obj = build_js_event(vm_ref, event);
+                        let event_obj = build_js_event(vm_ref, event, ctx);
                         // Swallow JS exceptions for now — exposing
                         // them via the dev-dock Console is a tiny
                         // follow-up that threads an output sink
@@ -220,14 +272,33 @@ impl EventListenerMap {
     }
 }
 
+fn ctx_stopped(ctx: Option<&EventDispatchCtx>) -> bool {
+    ctx.map(|c| c.event_flags.load(Ordering::SeqCst) & EVT_FLAG_STOP_PROPAGATION != 0)
+        .unwrap_or(false)
+}
+
+/// Snapshot the shared atomic into the in-flight `Event` so
+/// subsequent native (Rust-side) listeners observe the same
+/// state JS just set via preventDefault / stopPropagation.
+fn fold_atomic(ctx: Option<&EventDispatchCtx>, event: &mut Event) {
+    let Some(c) = ctx else { return };
+    let raised = c.event_flags.load(Ordering::SeqCst);
+    if raised & EVT_FLAG_DEFAULT_PREVENTED != 0 {
+        event.flags.default_prevented = true;
+    }
+    if raised & EVT_FLAG_STOP_PROPAGATION != 0 {
+        event.flags.stop_propagation = true;
+    }
+}
+
 /// Build a minimal JS `Event` object the listener callback sees as
-/// its single argument. Carries `type`, `target` (as a host handle
-/// when one is registered; null otherwise), `defaultPrevented`,
-/// and stub `preventDefault` / `stopPropagation` methods. The
-/// methods don't yet talk back to our Rust-side flags — that's the
-/// next refinement; until then a JS-only handler can react but
-/// can't actually cancel the chrome's default behaviour.
-fn build_js_event(vm: &mut Vm, event: &Event) -> Value {
+/// its single argument. Carries `type`, `bubbles`, `cancelable`,
+/// `defaultPrevented`, `target` (set to the host handle from
+/// `ctx.target_handle` when provided, `null` otherwise), and
+/// `preventDefault` / `stopPropagation` methods that mutate the
+/// shared `event_flags` atomic so the Rust side can observe
+/// cancellation after dispatch.
+fn build_js_event(vm: &mut Vm, event: &Event, ctx: Option<&EventDispatchCtx>) -> Value {
     let obj = vm.alloc_object();
     let type_val = vm.value_from_str(&event.kind);
     vm.set_property(obj, "type", type_val);
@@ -238,6 +309,25 @@ fn build_js_event(vm: &mut Vm, event: &Event) -> Value {
         "defaultPrevented",
         Value::boolean(event.flags.default_prevented),
     );
+    if let Some(c) = ctx {
+        vm.set_property(obj, "target", c.target_handle.unwrap_or(Value::null()));
+        // currentTarget tracks the node the listener was bound to
+        // during the walk. For the synthetic event we surface the
+        // same handle as target — it's a small inaccuracy when a
+        // listener fires during bubble / capture on an ancestor,
+        // but the common addEventListener('submit', form, …)
+        // pattern reads only `event.target` anyway.
+        vm.set_property(
+            obj,
+            "currentTarget",
+            c.target_handle.unwrap_or(Value::null()),
+        );
+        vm.set_property(obj, "preventDefault", c.prevent_default_fn);
+        vm.set_property(obj, "stopPropagation", c.stop_propagation_fn);
+    } else {
+        vm.set_property(obj, "target", Value::null());
+        vm.set_property(obj, "currentTarget", Value::null());
+    }
     obj
 }
 
@@ -322,6 +412,18 @@ mod tests {
         assert_eq!(log.lock().unwrap().as_slice(), &["c", "b"]);
     }
 
+    fn test_dispatch_ctx(event_flags: Arc<AtomicU32>) -> EventDispatchCtx {
+        EventDispatchCtx {
+            event_flags,
+            // For tests that don't exercise preventDefault, a
+            // null callable is fine — the JS handler doesn't
+            // reach for it.
+            prevent_default_fn: Value::null(),
+            stop_propagation_fn: Value::null(),
+            target_handle: None,
+        }
+    }
+
     #[test]
     fn js_listener_fires_via_dispatch_js() {
         // End-to-end: register a JS callback via addEventListener,
@@ -335,11 +437,6 @@ mod tests {
         // Shared map captured by the host fn closure.
         let map: Arc<Mutex<EventListenerMap>> = Arc::new(Mutex::new(EventListenerMap::default()));
 
-        // For this synthetic test we don't have a NodeId-to-handle
-        // map (BindingContext owns that on the real path); the
-        // listener just registers on every "click" event regardless
-        // of target. The host fn signature mirrors what the real
-        // `__addEventListener` will do.
         let map_for_fn = map.clone();
         let target = c;
         engine.register_host_fn("regClick", move |_vm, _this, args| {
@@ -350,20 +447,64 @@ mod tests {
             Ok(Value::null())
         });
 
-        // Register a JS callback that sets a global.
         engine
             .eval("var fired = 0; regClick('click', function(){ fired = fired + 1; });")
             .expect("register");
 
-        // Dispatch through the VM. The Rust path calls the JS
-        // callable via host_call which re-enters the engine.
+        let flags = Arc::new(AtomicU32::new(0));
+        let ctx = test_dispatch_ctx(flags.clone());
         let vm = engine.vm();
         let _ = map
             .lock()
             .unwrap()
-            .dispatch_js(&doc, Event::new("click", c), vm);
+            .dispatch_js(&doc, Event::new("click", c), vm, &ctx);
 
         let (out, _) = engine.eval_with_output("fired");
         assert_eq!(out, "1");
+    }
+
+    #[test]
+    fn js_listener_can_prevent_default() {
+        // Wire up preventDefault end-to-end: the host fn flips the
+        // shared atomic; dispatch_js folds it into Event.flags.
+        use zinc::engine::Engine;
+
+        let mut engine = Engine::new();
+        let (doc, _a, _b, c) = three_level();
+
+        let flags = Arc::new(AtomicU32::new(0));
+        let flags_for_fn = flags.clone();
+        engine.register_host_fn("__pd", move |_vm, _this, _args| {
+            flags_for_fn.fetch_or(EVT_FLAG_DEFAULT_PREVENTED, Ordering::SeqCst);
+            Ok(Value::null())
+        });
+        let prevent_default_fn = engine.eval("__pd").expect("fetch __pd");
+
+        let map: Arc<Mutex<EventListenerMap>> = Arc::new(Mutex::new(EventListenerMap::default()));
+        let map_for_fn = map.clone();
+        let target = c;
+        engine.register_host_fn("regSubmit", move |_vm, _this, args| {
+            let Some(callable) = args.get(1).copied() else { return Ok(Value::null()) };
+            if let Ok(mut m) = map_for_fn.lock() {
+                m.add_js(target, "submit", false, callable);
+            }
+            Ok(Value::null())
+        });
+        engine
+            .eval("regSubmit('submit', function(e){ e.preventDefault(); });")
+            .expect("register");
+
+        let ctx = EventDispatchCtx {
+            event_flags: flags,
+            prevent_default_fn,
+            stop_propagation_fn: Value::null(),
+            target_handle: None,
+        };
+        let vm = engine.vm();
+        let out = map
+            .lock()
+            .unwrap()
+            .dispatch_js(&doc, Event::new("submit", c), vm, &ctx);
+        assert!(out.flags.default_prevented);
     }
 }

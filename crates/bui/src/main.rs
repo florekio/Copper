@@ -1192,6 +1192,19 @@ struct TabState {
     /// actively dragging, `dragging` is true and `end` updates on
     /// each `on_drag` event; mouse-up freezes it.
     page_selection: Option<PageSelection>,
+    /// Live JS engine for this page. `Some` after a successful
+    /// fetch on a page with at least one binding install; user-
+    /// input handlers dispatch `submit` / `click` events through
+    /// it so JS-registered listeners observe the same engine
+    /// state they set up during the initial script pass. Cleared
+    /// on every navigation (each new page gets a fresh engine).
+    js_ctx: Option<bui_js::JsContext>,
+}
+
+#[derive(Default, Debug)]
+struct DispatchOutcome {
+    default_prevented: bool,
+    pending_nav: Option<String>,
 }
 
 /// Drag selection across page text. Coordinates are in absolute
@@ -1276,12 +1289,11 @@ impl TabState {
                 body: resp.body,
             })
         });
-        let (outcomes, _dirty, pending_nav) =
-            bui_js::execute_inline_scripts_with_dom_and_fetcher(
-                doc.clone(),
-                url.to_string(),
-                Some(fetcher),
-            );
+        let (mut js_ctx, outcomes) = bui_js::JsContext::install_and_run(
+            doc.clone(),
+            url.to_string(),
+            Some(fetcher),
+        );
         for outcome in outcomes {
             for line in &outcome.output {
                 eprintln!("[js] {line}");
@@ -1294,13 +1306,19 @@ impl TabState {
         // pending-nav drain handles a chain, capped only by the
         // server / cookie state (we don't loop forever in this
         // function — recursion bounds itself by call depth).
-        if let Some(target) = pending_nav {
+        if let Some(target) = js_ctx.take_pending_navigation() {
             if let Ok(next_url) = url.join(&target) {
                 if next_url.to_string() != url.to_string() {
                     return TabState::fetch(&next_url);
                 }
             }
         }
+        // Clear the dirty flag too — bindings tripped it during
+        // the script pass, but the layout we're about to build
+        // already reflects every mutation. The next dispatch
+        // (from user input) will set it again if a handler
+        // mutates the DOM and the orchestrator will re-layout.
+        let _ = js_ctx.take_dirty();
         let dlocked = doc.lock().unwrap();
         let sheets = collect_author_stylesheets(url, &dlocked);
         let mut style = bui_style::style_document(&dlocked, &sheets);
@@ -1414,6 +1432,7 @@ impl TabState {
             page_inputs,
             focused_input: autofocus_target,
             page_selection: None,
+            js_ctx: Some(js_ctx),
         })
     }
 
@@ -1441,6 +1460,11 @@ impl TabState {
         self.page_inputs.clear();
         self.focused_input = None;
         self.page_selection = None;
+        // Drop the old page's JS engine before installing the new
+        // one — listener closures captured Arc clones of the
+        // outgoing document, so holding both would keep the old
+        // DOM alive for no reason.
+        self.js_ctx = next.js_ctx;
     }
 
     fn navigate_to(&mut self, new_url: &Url) -> Result<(), String> {
@@ -1453,6 +1477,31 @@ impl TabState {
         self.forward = Vec::new();
         self.scroll_y = 0.0;
         Ok(())
+    }
+
+    /// Outcome of a JS event dispatch fired before a chrome
+    /// default action runs. The chrome inspects these bits to
+    /// decide what to do next.
+    fn dispatch_input_event(&mut self, kind: &str, target: bui_dom::NodeId) -> DispatchOutcome {
+        let Some(ctx) = self.js_ctx.as_mut() else {
+            return DispatchOutcome::default();
+        };
+        let event = ctx.dispatch(bui_js::Event::new(kind, target));
+        let pending = ctx.take_pending_navigation();
+        // We don't act on the dirty flag here — the orchestrator
+        // calls layout on every frame anyway, and the dispatch
+        // never mutates anything the current paint depends on
+        // (it'll show up on the next frame). If a handler did
+        // touch the DOM, `last_width = 0` below forces a re-
+        // layout next frame.
+        let dirty = ctx.take_dirty();
+        if dirty {
+            self.last_width = 0;
+        }
+        DispatchOutcome {
+            default_prevented: event.flags.default_prevented,
+            pending_nav: pending,
+        }
     }
 
     fn go_back(&mut self) -> bool {
@@ -3610,6 +3659,22 @@ fn handle_click(
             return true;
         }
         PageControlAction::SubmitForm(form_node) => {
+            let outcome = st
+                .active_tab_mut()
+                .dispatch_input_event("submit", form_node);
+            if let Some(target) = outcome.pending_nav {
+                if let Ok(next_url) = st.active_tab().url.join(&target) {
+                    eprintln!("↳ form submit (JS-redirect) → {next_url}");
+                    if let Err(e) = st.active_tab_mut().navigate_to(&next_url) {
+                        eprintln!("submit redirect failed: {e}");
+                    }
+                    return true;
+                }
+            }
+            if outcome.default_prevented {
+                eprintln!("↳ form submit suppressed by JS handler");
+                return true;
+            }
             if let Some(url) = build_form_url(st.active_tab(), form_node) {
                 eprintln!("↳ form submit → {url}");
                 if let Err(e) = st.active_tab_mut().navigate_to(&url) {
@@ -3941,6 +4006,7 @@ mod tests {
             page_inputs: std::collections::HashMap::new(),
             focused_input: None,
             page_selection: None,
+            js_ctx: None,
         }
     }
 
@@ -3989,6 +4055,7 @@ mod tests {
             page_inputs: std::collections::HashMap::new(),
             focused_input: None,
             page_selection: None,
+            js_ctx: None,
         };
         let url = build_form_url(&tab, form).expect("form url");
         assert_eq!(url.path, "/search");
@@ -4487,6 +4554,22 @@ fn handle_page_input_key(st: &mut BrowserState, press: KeyPress) -> Option<bool>
             }
             st.active_tab_mut().last_width = 0;
             if let Some(form_node) = form {
+                let outcome = st
+                    .active_tab_mut()
+                    .dispatch_input_event("submit", form_node);
+                if let Some(target) = outcome.pending_nav {
+                    if let Ok(next_url) = st.active_tab().url.join(&target) {
+                        eprintln!("↳ form submit (Enter, JS-redirect) → {next_url}");
+                        if let Err(e) = st.active_tab_mut().navigate_to(&next_url) {
+                            eprintln!("submit redirect failed: {e}");
+                        }
+                        return Some(true);
+                    }
+                }
+                if outcome.default_prevented {
+                    eprintln!("↳ form submit (Enter) suppressed by JS handler");
+                    return Some(true);
+                }
                 if let Some(url) = build_form_url(st.active_tab(), form_node) {
                     eprintln!("↳ form submit (Enter) → {url}");
                     if let Err(e) = st.active_tab_mut().navigate_to(&url) {

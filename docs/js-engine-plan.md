@@ -19,14 +19,17 @@ same plumbing.
 
 Milestone status (May 2026):
 
-Phases 1–5 shipped. Phase 6 partially shipped — a synthetic
-`load` event now fires after the script pass so handlers
-registered via `window.addEventListener('load', …)` run once.
-Routing real user input (click / keydown / submit) through
-`EventListenerMap::dispatch_js` is the explicit follow-up and
-the precondition for landing a results page with real `<h3>`
-headings; the smoke test still asserts the structural homepage
-form and not result content. Concretely:
+Phases 1–5 shipped. Phase 6 shipped on the engine side and on
+the host side for form submit (Enter in a focused input + click
+on a submit-style control). A `submit` event now fires through
+`EventListenerMap::dispatch_js` before the chrome's default
+navigate; `event.preventDefault()` flips a Rust-side flag so
+the host suppresses its native form submit, and a handler that
+sets `location.href = …` drains as the navigation target on
+the same input frame. The smoke test still asserts the
+structural homepage form rather than `<h3>` results — wiring
+`click` / `keydown` events the same way is the next iteration
+once we have a real Google session to drive. Concretely:
 
 - `bui-js` runs inline `<script>` tags through Zinc with
   read+write DOM bindings.
@@ -35,7 +38,18 @@ form and not result content. Concretely:
   `host_call`.
 - `__addEventListener` registers JS callbacks on (NodeId, type,
   capture) tuples; tested end-to-end in
-  `events::tests::js_listener_fires_via_dispatch_js`.
+  `events::tests::js_listener_fires_via_dispatch_js` and
+  `tests::element_level_add_event_listener_fires_on_target`.
+- `Event.preventDefault()` / `stopPropagation()` are host fns
+  bound to a per-`JsContext` atomic; `dispatch_js` snapshots and
+  folds the atomic into `Event.flags` so a JS handler can
+  cancel the host's default action
+  (`events::tests::js_listener_can_prevent_default`).
+- `JsContext` (in `crates/bui-js/src/lib.rs`) owns the
+  `Engine` + `BindingContext` for the lifetime of a page and
+  exposes `dispatch(event)` so user-input frames re-enter the
+  same VM the inline scripts set up
+  (`tests::js_context_dispatches_submit_after_script_pass`).
 - `fetch(url)` is synchronous, backed by an embedder-supplied
   `Fetcher` closure that bridges to `shared_client()` and
   records into the dev-dock XHR tab.
@@ -209,7 +223,7 @@ scheduling. Without these the submit handler waits forever.
 **Verification:** a `setTimeout(() => console.log('tick'), 50)`
 test sees the log line within ~one frame.
 
-### Phase 6 — Drop the DDG redirect; ship real Google (partial)
+### Phase 6 — Drop the DDG redirect; ship real Google (form submit live)
 
 **Shipped:**
 - `maybe_rewrite_google_search` is a no-op pass-through;
@@ -220,23 +234,27 @@ test sees the log line within ~one frame.
   `addEventListener('load', …)` handlers run inside the same
   VM and any navigation they request via `location.href = …`
   lands in the same `pending_nav` slot the host already drains.
+- `TabState` owns a `bui_js::JsContext` for the lifetime of
+  the page. Submit paths (Enter in a focused input + click on
+  a submit-style control) dispatch a `submit` event through
+  the persistent engine before any default action: handlers
+  observe `event.target` as a real wrapped element, can call
+  `event.preventDefault()` to suppress the chrome's native
+  form submit, and can do `location.href = …` to redirect via
+  the existing pending-nav drain.
 - `tools/google_smoke.sh` asserts the homepage form is
-  structurally reachable (the same shape as the earlier
-  milestone — tightening it to `<h3>` results requires the
-  follow-up below).
+  structurally reachable.
 
-**Deferred follow-up (not yet shipped):**
-- Routing real user input (click / keydown / submit) from the
-  chrome layer through `EventListenerMap::dispatch_js`. Today,
-  user input still fires Rust-side handlers only and the
-  engine is torn down between page loads, so a JS `submit`
-  interceptor never sees the user's Enter key. Wiring this
-  requires keeping the `Engine` alive across user-input frames
-  on `TabState` rather than scoping it to one script pass —
-  a substantive refactor of the host loop.
-- Once user-input dispatch is live, tighten
-  `tools/google_smoke.sh` to assert a real `<h3>` result
-  appears after a simulated form submit.
+**Deferred follow-up:**
+- Route `click` and `keydown` user input through the same
+  `JsContext::dispatch` so non-submit handlers (autocomplete
+  suggestions, anchor interceptors, modal close-on-Escape)
+  light up. The plumbing is built; the remaining work is
+  picking event targets from the hit-test result and the
+  focused input.
+- Once enough Google JS runs end-to-end to land on a real
+  results page, tighten `tools/google_smoke.sh` to assert a
+  `<h3>` result heading.
 - Add a section to `docs/architecture.md` / `docs/dev-dock.md`
   describing the new JS surface.
 
