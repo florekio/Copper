@@ -144,6 +144,14 @@ impl JsContext {
         };
 
         let mut engine = Engine::new();
+        // Cap VM steps per `eval` / `host_call` so a runaway script
+        // (Google's homepage hits requestAnimationFrame loops and
+        // similar) can't hang the browser indefinitely. 50M is
+        // generous enough that real pages finish their bootstrap
+        // (Wikipedia, the dev-dock probe page) yet aborts a true
+        // infinite loop in under a second. Without this the
+        // browser thread blocks forever on bad JS.
+        engine.set_max_steps(50_000_000);
         let bindings = BindingContext::install_with_fetcher(
             &mut engine,
             doc.clone(),
@@ -182,15 +190,25 @@ impl JsContext {
     /// listeners. Returns the post-dispatch event with
     /// `flags.default_prevented` / `flags.stop_propagation`
     /// folded in so the caller can suppress its default action.
+    ///
+    /// The doc lock is held just long enough to build the
+    /// target's ancestor chain, then dropped before any
+    /// listener runs — JS handlers routinely call back into
+    /// `getAttribute` / `querySelector` host fns which relock
+    /// the same doc, and holding it across the walk
+    /// deadlocks the dispatch.
     pub fn dispatch(&mut self, event: Event) -> Event {
         let target = event.target;
         let dispatch_ctx = self
             .bindings
             .event_dispatch_ctx(self.bindings.handle_for_node(target));
+        let path = {
+            let dlocked = self.doc.lock().unwrap();
+            crate::events::ancestor_path(&dlocked, target)
+        };
         let listeners = self.bindings.listeners();
-        let dlocked = self.doc.lock().unwrap();
         let mut map = listeners.lock().unwrap();
-        map.dispatch_js(&dlocked, event, self.engine.vm(), &dispatch_ctx)
+        map.dispatch_js_path(path, event, self.engine.vm(), &dispatch_ctx)
     }
 
     /// Drain the URL JS asked us to navigate to. Returns `None`
@@ -442,6 +460,54 @@ mod tests {
         // And we observe the side-effect of the handler running.
         let (fired, _) = ctx.engine.eval_with_output("fired");
         assert_eq!(fired, "1");
+    }
+
+    /// Regression: a JS listener that calls back into a host fn
+    /// requiring the doc lock used to deadlock because the
+    /// dispatch held the same lock across the listener walk.
+    /// Now `JsContext::dispatch` resolves the ancestor chain
+    /// up front and releases the lock before invoking
+    /// listeners. This test wires Google's actual homepage
+    /// pattern — handler does `e.target.getAttribute(...)` —
+    /// and asserts the dispatch completes and the handler
+    /// observed the real attribute value.
+    ///
+    /// Note: we can't move the dispatch off this thread
+    /// (Zinc's `Engine` isn't `Send` because its JIT cache
+    /// holds raw executable-page pointers), so if a future
+    /// change reintroduces the deadlock this test hangs the
+    /// suite. The hang is a strictly louder failure than a
+    /// silent regression.
+    #[test]
+    fn dispatch_doesnt_deadlock_when_listener_calls_doc_locking_host_fn() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let form = d.create_element("form");
+        d.element_mut(form).unwrap().set_attr("data-submitfalse", "1");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "globalThis.seenC = 'not-fired';\n\
+             document.addEventListener('submit', function(e){\n\
+                 // The exact shape of Google's submit interceptor —\n\
+                 // it reads an attribute off the event target, which\n\
+                 // routes through a host fn that relocks the same\n\
+                 // Mutex<Document> the dispatch was holding.\n\
+                 globalThis.seenC = e.target.getAttribute('data-submitfalse');\n\
+             });",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, form);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        let _ = ctx.dispatch(Event::new("submit", form));
+        let (seen, _) = ctx.engine.eval_with_output("seenC");
+        assert_eq!(seen, "1", "handler ran and read the form attribute");
     }
 
     /// Same shape as the document-level test above, but the

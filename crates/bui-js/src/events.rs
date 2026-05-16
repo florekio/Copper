@@ -149,7 +149,8 @@ impl EventListenerMap {
     /// in the same entry are skipped because a VM isn't available.
     /// Used by tests and any host code without engine access.
     pub fn dispatch(&mut self, doc: &Document, event: Event) -> Event {
-        self.dispatch_inner(doc, event, None, None)
+        let path = ancestor_path(doc, event.target);
+        self.dispatch_inner(path, event, None, None)
     }
 
     /// Dispatch firing every listener — Rust-side and JS-side.
@@ -167,11 +168,25 @@ impl EventListenerMap {
         vm: &mut Vm,
         ctx: &EventDispatchCtx,
     ) -> Event {
-        // Snapshot + reset the shared atomic so a re-entrant
-        // dispatch (a JS listener doing `el.dispatchEvent(...)`,
-        // not yet wired) can't leak prior flag bits into ours.
+        let path = ancestor_path(doc, event.target);
+        self.dispatch_js_path(path, event, vm, ctx)
+    }
+
+    /// Dispatch where the caller has already resolved the
+    /// target's ancestor chain (root-most last). Use this
+    /// when you can't hold the document lock across the
+    /// dispatch — any JS listener that reaches back into a
+    /// host fn (`getAttribute`, `querySelector`, …) tries to
+    /// relock the same doc and would otherwise deadlock.
+    pub fn dispatch_js_path(
+        &mut self,
+        path: Vec<NodeId>,
+        event: Event,
+        vm: &mut Vm,
+        ctx: &EventDispatchCtx,
+    ) -> Event {
         let prev = ctx.event_flags.swap(0, Ordering::SeqCst);
-        let mut out = self.dispatch_inner(doc, event, Some(vm), Some(ctx));
+        let mut out = self.dispatch_inner(path, event, Some(vm), Some(ctx));
         let raised = ctx.event_flags.swap(prev, Ordering::SeqCst);
         if raised & EVT_FLAG_DEFAULT_PREVENTED != 0 {
             out.flags.default_prevented = true;
@@ -184,19 +199,11 @@ impl EventListenerMap {
 
     fn dispatch_inner(
         &mut self,
-        doc: &Document,
+        path: Vec<NodeId>,
         mut event: Event,
         vm: Option<&mut Vm>,
         ctx: Option<&EventDispatchCtx>,
     ) -> Event {
-        // Build path from target up to root (inclusive).
-        let mut path: Vec<NodeId> = Vec::new();
-        let mut cur = Some(event.target);
-        while let Some(id) = cur {
-            path.push(id);
-            cur = doc.node(id).parent;
-        }
-
         // Wrap the optional VM in a small cell so the borrow checker
         // is happy when `invoke` is called multiple times in this
         // function. We pass `&mut Option<&mut Vm>` down.
@@ -270,6 +277,20 @@ impl EventListenerMap {
             }
         }
     }
+}
+
+/// Walk `target` → root, collecting NodeIds in document-leaf-first
+/// order. Caller holds the doc lock just long enough to build the
+/// path, then drops it before invoking listeners — so a JS handler
+/// can call back into a host fn that relocks the same doc.
+pub fn ancestor_path(doc: &Document, target: NodeId) -> Vec<NodeId> {
+    let mut path = Vec::new();
+    let mut cur = Some(target);
+    while let Some(id) = cur {
+        path.push(id);
+        cur = doc.node(id).parent;
+    }
+    path
 }
 
 fn ctx_stopped(ctx: Option<&EventDispatchCtx>) -> bool {
