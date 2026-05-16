@@ -102,8 +102,14 @@ pub fn execute_inline_scripts_with_dom_and_fetcher(
     };
 
     let mut engine = Engine::new();
+    // Keep a clone of the doc arc so we can fire a synthetic `load`
+    // event below, after the script pass has finished registering
+    // listeners. (BindingContext owns the arc internally for
+    // every host fn that needs it; we need a reference too.)
+    let doc_for_load = doc.clone();
     let ctx = BindingContext::install_with_fetcher(&mut engine, doc, current_url, fetcher);
     let dirty_flag = ctx.dirty();
+    let listeners = ctx.listeners();
 
     let mut out = Vec::with_capacity(scripts.len());
     for (node, source) in scripts {
@@ -123,6 +129,22 @@ pub fn execute_inline_scripts_with_dom_and_fetcher(
             output,
         });
     }
+
+    // Fire a synthetic `load` event before tearing down the
+    // engine. Inline scripts that registered `window
+    // .addEventListener('load', …)` (or document/documentElement
+    // equivalents) get one fan-out opportunity before user-input
+    // dispatch is wired through TabState in a future phase. Any
+    // pending navigation the handler set via `location.href =
+    // …` is picked up by the same take_pending_navigation below.
+    {
+        let dlocked = doc_for_load.lock().unwrap();
+        let root = dlocked.root;
+        let mut map = listeners.lock().unwrap();
+        let event = crate::events::Event::new("load", root);
+        let _ = map.dispatch_js(&dlocked, event, engine.vm());
+    }
+
     let dirty = dirty_flag.load(Ordering::SeqCst);
     let pending_nav = ctx.take_pending_navigation();
     (out, dirty, pending_nav)

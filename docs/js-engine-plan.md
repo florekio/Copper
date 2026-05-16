@@ -17,20 +17,39 @@ client-side JS — which is most of the modern web. Treat Google as
 the canonical hard target; smaller sites should fall out of the
 same plumbing.
 
-Today's status (verified end-of-2026):
+Milestone status (May 2026):
+
+Phases 1–5 shipped. Phase 6 partially shipped — a synthetic
+`load` event now fires after the script pass so handlers
+registered via `window.addEventListener('load', …)` run once.
+Routing real user input (click / keydown / submit) through
+`EventListenerMap::dispatch_js` is the explicit follow-up and
+the precondition for landing a results page with real `<h3>`
+headings; the smoke test still asserts the structural homepage
+form and not result content. Concretely:
 
 - `bui-js` runs inline `<script>` tags through Zinc with
-  read+write DOM bindings (querySelector, setAttribute,
-  appendChild, classList, …).
-- Event-listener infrastructure exists Rust-side
-  (`EventListenerMap` in `crates/bui-js/src/events.rs`) but
-  doesn't fire from JS callbacks.
-- `addEventListener`, `fetch`, `XMLHttpRequest`, `setTimeout` are
-  no-op stubs.
-- A side-channel `__navigate` host fn wires `location.assign /
-  replace` into a real navigation.
-- Zinc has a known upvalue-closing panic on heavy scripts
-  (`vm.rs:663`) — currently caught with `panic::catch_unwind`.
+  read+write DOM bindings.
+- `EventListenerMap` accepts both Rust closures and JS callables
+  (`Listener::Js(Value)`); `dispatch_js` re-enters the VM via
+  `host_call`.
+- `__addEventListener` registers JS callbacks on (NodeId, type,
+  capture) tuples; tested end-to-end in
+  `events::tests::js_listener_fires_via_dispatch_js`.
+- `fetch(url)` is synchronous, backed by an embedder-supplied
+  `Fetcher` closure that bridges to `shared_client()` and
+  records into the dev-dock XHR tab.
+- `setTimeout(fn, 0)` fires synchronously after the script
+  returns; non-zero delays are dropped (acceptable for Google's
+  microtask-shim use of `setTimeout(…, 0)`).
+- `__navigate` side channel handles `location.href` /
+  `assign` / `replace` and feeds back into the host's
+  `navigate_to`.
+- Zinc patches landed: `close_upvalues_above` bounds-checks
+  stale slots (closes to `undefined` instead of panicking);
+  `Vm::alloc_host_object` mirrors `Engine::alloc_host_object`
+  so `document.createElement` can mint host handles from inside
+  a host-fn callback. `panic::catch_unwind` is gone.
 
 ## Goal
 
@@ -190,18 +209,36 @@ scheduling. Without these the submit handler waits forever.
 **Verification:** a `setTimeout(() => console.log('tick'), 50)`
 test sees the log line within ~one frame.
 
-### Phase 6 — Drop the DDG redirect; ship real Google
+### Phase 6 — Drop the DDG redirect; ship real Google (partial)
 
-**Scope:**
-- Delete `maybe_rewrite_google_search` (or repurpose to a no-op
-  for clarity).
-- Keep the `seed_google_consent` cookie seeding — useful even
-  with real JS so the consent gate never appears.
-- `tools/google_smoke.sh` becomes a real assertion: navigate
-  to `https://www.google.com/?q=…` (or simulate the form
-  submit) and check the layout dump for `<h3>` result headings.
-- A regression in `docs/architecture.md` and `docs/dev-dock.md`
-  notes the new JS surface.
+**Shipped:**
+- `maybe_rewrite_google_search` is a no-op pass-through;
+  `seed_google_consent` still seeds the CONSENT/SOCS cookies so
+  the consent gate never appears.
+- After the inline-script pass, the orchestrator fires one
+  synthetic `load` event on the document root. JS-side
+  `addEventListener('load', …)` handlers run inside the same
+  VM and any navigation they request via `location.href = …`
+  lands in the same `pending_nav` slot the host already drains.
+- `tools/google_smoke.sh` asserts the homepage form is
+  structurally reachable (the same shape as the earlier
+  milestone — tightening it to `<h3>` results requires the
+  follow-up below).
+
+**Deferred follow-up (not yet shipped):**
+- Routing real user input (click / keydown / submit) from the
+  chrome layer through `EventListenerMap::dispatch_js`. Today,
+  user input still fires Rust-side handlers only and the
+  engine is torn down between page loads, so a JS `submit`
+  interceptor never sees the user's Enter key. Wiring this
+  requires keeping the `Engine` alive across user-input frames
+  on `TabState` rather than scoping it to one script pass —
+  a substantive refactor of the host loop.
+- Once user-input dispatch is live, tighten
+  `tools/google_smoke.sh` to assert a real `<h3>` result
+  appears after a simulated form submit.
+- Add a section to `docs/architecture.md` / `docs/dev-dock.md`
+  describing the new JS surface.
 
 ## Critical files
 
