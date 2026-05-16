@@ -208,7 +208,28 @@ impl JsContext {
         };
         let listeners = self.bindings.listeners();
         let mut map = listeners.lock().unwrap();
-        map.dispatch_js_path(path, event, self.engine.vm(), &dispatch_ctx)
+        let out = map.dispatch_js_path(path, event, self.engine.vm(), &dispatch_ctx);
+        // Drop the listener-map lock before draining microtasks —
+        // a Promise.then callback that came due during dispatch
+        // may register a new listener and would otherwise re-take
+        // this same lock.
+        drop(map);
+        // Drain queued Promise reactions ([[ResolveJobs]] etc.).
+        // Listeners that call `fetch(...).then(cb)` or
+        // `await something` queue their continuation as a
+        // microtask; without this drain the continuation never
+        // runs — equivalent to the browser's "run a JS task,
+        // then microtasks" abstraction.
+        let _ = self.engine.vm().drain_microtasks();
+        out
+    }
+
+    /// Drain queued Promise reactions. The embedder calls this
+    /// from its frame tick so async work (fetch resolutions,
+    /// async function continuations) doesn't accumulate across
+    /// frames.
+    pub fn drain_microtasks(&mut self) {
+        let _ = self.engine.vm().drain_microtasks();
     }
 
     /// Drain the URL JS asked us to navigate to. Returns `None`
@@ -460,6 +481,79 @@ mod tests {
         // And we observe the side-effect of the handler running.
         let (fired, _) = ctx.engine.eval_with_output("fired");
         assert_eq!(fired, "1");
+    }
+
+    /// Phase 7: Promise.then callbacks inside an event handler
+    /// run before `dispatch` returns. Real browsers expose this
+    /// as "microtask drain after every task"; without explicit
+    /// drainage, `.then(cb)` queues `cb` and never fires.
+    ///
+    /// This is the prerequisite for async fetch (Phase 9) and
+    /// async/await in event handlers.
+    #[test]
+    fn promise_then_inside_event_handler_fires_before_dispatch_returns() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let form = d.create_element("form");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "globalThis.steps = [];\n\
+             document.addEventListener('submit', function(e){\n\
+                 globalThis.steps.push('sync');\n\
+                 Promise.resolve('async').then(function(v){\n\
+                     globalThis.steps.push(v);\n\
+                 });\n\
+             });",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, form);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        let _ = ctx.dispatch(Event::new("submit", form));
+        // Both the synchronous handler body and the Promise.then
+        // continuation should have run by the time `dispatch`
+        // returns — that's the contract microtask drainage gives
+        // us.
+        let (steps, _) = ctx.engine.eval_with_output("steps.join(',')");
+        assert_eq!(steps, "sync,async");
+    }
+
+    /// Phase 7: async function with `await` inside an event
+    /// handler also drains by the time `dispatch` returns. The
+    /// `await` desugars into a Promise continuation queued onto
+    /// the same microtask queue.
+    #[test]
+    fn async_await_inside_event_handler_runs_to_completion() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let form = d.create_element("form");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "globalThis.result = null;\n\
+             async function go() { return await Promise.resolve(42); }\n\
+             document.addEventListener('submit', function(_e){\n\
+                 go().then(function(v){ globalThis.result = v; });\n\
+             });",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, form);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        let _ = ctx.dispatch(Event::new("submit", form));
+        let (result, _) = ctx.engine.eval_with_output("result");
+        assert_eq!(result, "42");
     }
 
     /// Regression: a JS listener that calls back into a host fn
