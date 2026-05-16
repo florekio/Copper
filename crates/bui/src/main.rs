@@ -1256,8 +1256,32 @@ impl TabState {
         // immediately below so the hint is informational only at
         // fetch time; it'll be load-bearing once timers / events
         // fire scripts AFTER the initial layout.
+        // Synchronous fetcher backing JS-side `fetch(url, opts)`.
+        // Resolves the URL against the page's base (so a script
+        // calling `fetch('/api/x')` lands on the same host), then
+        // does a blocking GET via the shared client. Recorded into
+        // NET_CAPTURE so the dev-dock XHR tab shows the request.
+        let base_url = url.clone();
+        let fetcher: bui_js::Fetcher = std::sync::Arc::new(move |raw: &str| {
+            let resolved = base_url.join(raw).ok()?;
+            let started = std::time::Instant::now();
+            let resp = shared_runtime()
+                .block_on(shared_client().get(&resolved))
+                .ok()?;
+            let ms = started.elapsed().as_millis() as u32;
+            net_record("GET", &resolved, resp.status, ms, resp.body.len());
+            Some(bui_js::FetchResponse {
+                status: resp.status,
+                url: resolved.to_string(),
+                body: resp.body,
+            })
+        });
         let (outcomes, _dirty, pending_nav) =
-            bui_js::execute_inline_scripts_with_dom(doc.clone(), url.to_string());
+            bui_js::execute_inline_scripts_with_dom_and_fetcher(
+                doc.clone(),
+                url.to_string(),
+                Some(fetcher),
+            );
         for outcome in outcomes {
             for line in &outcome.output {
                 eprintln!("[js] {line}");

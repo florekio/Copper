@@ -89,6 +89,23 @@ impl DomShared {
     }
 }
 
+/// One captured HTTP fetch — what the embedder hands to bui-js
+/// when an inline script calls `fetch(url)`. Status `0` signals
+/// the request failed before producing a real response (DNS,
+/// TLS, timeout, etc.); `body` is the response body bytes.
+#[derive(Debug, Clone)]
+pub struct FetchResponse {
+    pub status: u16,
+    pub url: String,
+    pub body: Vec<u8>,
+}
+
+/// Synchronous fetcher the embedder supplies via
+/// `BindingContext::install`. Returns `Some(FetchResponse)` for a
+/// completed request (success or HTTP error), `None` when the
+/// request couldn't be issued at all.
+pub type Fetcher = Arc<dyn Fn(&str) -> Option<FetchResponse> + Send + Sync>;
+
 pub struct BindingContext {
     shared: Arc<Mutex<DomShared>>,
     elem_tag: HostTag,
@@ -119,6 +136,22 @@ impl BindingContext {
         engine: &mut Engine,
         doc: Arc<Mutex<Document>>,
         current_url: String,
+    ) -> Self {
+        Self::install_with_fetcher(engine, doc, current_url, None)
+    }
+
+    /// Like `install`, but also wires the JS-side `fetch(url)` to
+    /// a synchronous HTTP fetcher the embedder provides. Without a
+    /// fetcher, `fetch` returns a Response object with `ok: false`
+    /// and `status: 0`. With one, the script can call `fetch('/x')
+    /// .then(r => r.json())` and get real data back synchronously
+    /// — the `.then` chain on our Response value calls the
+    /// callback immediately.
+    pub fn install_with_fetcher(
+        engine: &mut Engine,
+        doc: Arc<Mutex<Document>>,
+        current_url: String,
+        fetcher: Option<Fetcher>,
     ) -> Self {
         let elem_tag = engine.register_host_class("HTMLElement");
 
@@ -731,6 +764,40 @@ impl BindingContext {
             Ok(Value::null())
         });
 
+        // ---- Synchronous fetch ----
+        //
+        // `__fetch_sync(url)` blocks on the embedder-supplied
+        // fetcher, returns a JS object the prelude's `fetch`
+        // wrapper turns into a Response-shaped thenable. No
+        // promises yet — Phase 4's contract is "fetch(url).then(r
+        // => …)" works synchronously, which is enough for the
+        // submit-then-render pattern Google's homepage uses.
+        let fetcher_for_fn = fetcher.clone();
+        engine.register_host_fn("__fetch_sync", move |vm, _this, args| {
+            let url = read_str(vm, args.first()).unwrap_or_default();
+            let obj = vm.alloc_object();
+            // Default response shape — populated below if the fetch
+            // succeeds.
+            vm.set_property(obj, "ok", Value::boolean(false));
+            vm.set_property(obj, "status", Value::int(0));
+            let empty = vm.value_from_str("");
+            vm.set_property(obj, "url", empty);
+            vm.set_property(obj, "body", empty);
+            if let Some(ref f) = fetcher_for_fn {
+                if let Some(resp) = f(&url) {
+                    let ok = (200..300).contains(&resp.status);
+                    vm.set_property(obj, "ok", Value::boolean(ok));
+                    vm.set_property(obj, "status", Value::int(resp.status as i32));
+                    let url_v = vm.value_from_str(&resp.url);
+                    vm.set_property(obj, "url", url_v);
+                    let body = String::from_utf8_lossy(&resp.body).into_owned();
+                    let body_v = vm.value_from_str(&body);
+                    vm.set_property(obj, "body", body_v);
+                }
+            }
+            Ok(obj)
+        });
+
         // ---- JS prelude wrapping the `__` host fns ----
         let _ = engine.eval(PRELUDE);
 
@@ -973,6 +1040,58 @@ function __noop() {}
 function __ael(type, listener, capture) {
     __addEventListener(null, type, listener, capture === true);
 }
+// Synchronous fetch wrapper. __fetch_sync blocks on the embedder
+// fetcher and returns { ok, status, url, body }. We layer the
+// Response surface on top: text(), json(), and a thenable
+// .then/.catch/.finally chain that fires synchronously. No real
+// Promise — Zinc doesn't yet expose a Promise API to embedders
+// for host-resolved promises. Most fetch-using code in the wild
+// (Google's submit interceptor included) chains .then/.catch
+// without observing async, so a synchronous shim works.
+function fetch(url, _opts) {
+    var raw = __fetch_sync(url || '');
+    var resp = {
+        ok: raw.ok,
+        status: raw.status,
+        statusText: raw.ok ? 'OK' : 'Error',
+        url: raw.url,
+        // `.body` isn't part of the standard fetch Response surface
+        // (the standard is .text() / .json() / etc.) but it's a
+        // convenient escape hatch and the test path uses it.
+        body: raw.body,
+        headers: { get: function(_n) { return null; }, has: function(_n) { return false; } },
+        text: function() {
+            var body = raw.body;
+            var done = false;
+            return {
+                then: function(cb) {
+                    if (!done) { done = true; cb(body); }
+                    return this;
+                },
+                catch: function() { return this; },
+                finally: function(cb) { cb(); return this; }
+            };
+        },
+        json: function() {
+            var parsed;
+            try { parsed = JSON.parse(raw.body); }
+            catch (e) { parsed = null; }
+            return {
+                then: function(cb) { cb(parsed); return this; },
+                catch: function() { return this; },
+                finally: function(cb) { cb(); return this; }
+            };
+        }
+    };
+    resp.then = function(cb) {
+        var r = cb(this);
+        if (r && typeof r.then === 'function') { return r; }
+        return this;
+    };
+    resp.catch = function() { return resp; };
+    resp.finally = function(cb) { cb(); return resp; };
+    return resp;
+}
 document.addEventListener = __ael;
 document.removeEventListener = __noop;
 document.documentElement = {
@@ -987,7 +1106,7 @@ var window = {
     location: location,
     navigator: navigator,
     history: history,
-    fetch: __noop,
+    fetch: fetch,
     setTimeout: __noop,
     clearTimeout: __noop,
     requestAnimationFrame: __noop,
@@ -1292,6 +1411,58 @@ mod tests {
         collect_text(&d, first, &mut text);
         assert_eq!(text, "hi from js");
         assert!(ctx.dirty().load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn fetch_routes_through_embedder_supplied_fetcher() {
+        // Phase 4: a script calls fetch(url) and gets a Response
+        // object whose `.then(r => r.body)` synchronously sees the
+        // body the embedder fetcher returned.
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let url_seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let url_for_fetcher = url_seen.clone();
+        let fetcher: Fetcher = std::sync::Arc::new(move |u| {
+            *url_for_fetcher.lock().unwrap() = Some(u.to_string());
+            Some(FetchResponse {
+                status: 200,
+                url: u.to_string(),
+                body: br#"{"ok":true,"hello":"world"}"#.to_vec(),
+            })
+        });
+        let _ctx = BindingContext::install_with_fetcher(
+            &mut engine,
+            doc,
+            String::from("https://example.com/page"),
+            Some(fetcher),
+        );
+
+        // Script: synchronous fetch + .then chain on the
+        // Response. We pull the status into a global, then the
+        // body via .text(), then check the JSON path also works.
+        engine
+            .eval(
+                "var captured = {};\
+                 fetch('/api/x').then(function(r){ \
+                     captured.status = r.status; \
+                     captured.ok = r.ok; \
+                     captured.body = r.body; \
+                 });",
+            )
+            .expect("eval");
+
+        let (status, _) = engine.eval_with_output("captured.status");
+        let (ok, _) = engine.eval_with_output("captured.ok");
+        let (body, _) = engine.eval_with_output("captured.body");
+        assert_eq!(status, "200");
+        assert_eq!(ok, "true");
+        assert!(body.contains("\"hello\":\"world\""), "body was {body:?}");
+
+        // And the embedder fetcher saw the URL.
+        assert_eq!(
+            url_seen.lock().unwrap().as_deref(),
+            Some("/api/x"),
+        );
     }
 
     #[test]

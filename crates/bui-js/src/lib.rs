@@ -23,7 +23,7 @@
 pub mod dom_bindings;
 pub mod events;
 
-pub use dom_bindings::BindingContext;
+pub use dom_bindings::{BindingContext, FetchResponse, Fetcher};
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -82,6 +82,18 @@ pub fn execute_inline_scripts_with_dom(
     doc: Arc<Mutex<Document>>,
     current_url: String,
 ) -> (Vec<ScriptOutcome>, bool, Option<String>) {
+    execute_inline_scripts_with_dom_and_fetcher(doc, current_url, None)
+}
+
+/// Like `execute_inline_scripts_with_dom`, but also supplies a
+/// synchronous fetcher that backs the JS-side `fetch(url)`.
+/// Without one, inline scripts that call `fetch` get a Response
+/// shape whose `.ok` is `false` and body is empty.
+pub fn execute_inline_scripts_with_dom_and_fetcher(
+    doc: Arc<Mutex<Document>>,
+    current_url: String,
+    fetcher: Option<Fetcher>,
+) -> (Vec<ScriptOutcome>, bool, Option<String>) {
     // Collect script sources up front. We hold the doc lock only
     // for the walk so install + eval can take it themselves.
     let scripts = {
@@ -90,7 +102,7 @@ pub fn execute_inline_scripts_with_dom(
     };
 
     let mut engine = Engine::new();
-    let ctx = BindingContext::install(&mut engine, doc, current_url);
+    let ctx = BindingContext::install_with_fetcher(&mut engine, doc, current_url, fetcher);
     let dirty_flag = ctx.dirty();
 
     let mut out = Vec::with_capacity(scripts.len());
