@@ -622,17 +622,23 @@ fn is_google_search_host(host: &str) -> bool {
         })
 }
 
-/// No-op pass-through. We used to redirect google.com/search to
-/// DuckDuckGo's HTML endpoint as a stand-in for non-JS search,
-/// but the user wants real Google. Without a working JS engine
-/// (see `docs/js-engine-plan.md`) /search lands on Google's
-/// `<noscript><meta refresh>` enable-JS notice — that's the
-/// honest behaviour we ship for now. The `seed_google_consent`
-/// cookies still bypass the consent gate so the user doesn't
-/// even hit the 405-after-accept flow.
+/// No-op pass-through. Historically we rewrote
+/// `google.<tld>/search?q=…` to append `&gbv=1` and land on
+/// Google's basic-HTML results page. As of 2026 that endpoint
+/// is dead — it serves the same `<noscript><meta refresh>`
+/// "enable JS" shell as the unrewritten URL, just with a tiny
+/// stub document and a meta-refresh to `/httpservice/retry/
+/// enablejs`. Either way the user lands on a page whose only
+/// visible content sits inside `<noscript>` (and is hidden by
+/// our UA stylesheet because we *do* have a JS engine, just
+/// not one that runs Google's Closure-library bundle).
 ///
-/// Removed once Phase 6 of the JS-engine milestone lands and we
-/// can render Google's modern results inline.
+/// Until we either shim enough Closure runtime to boot the
+/// modern shell or route Google search through a different
+/// backend, this stays a pass-through and the search-results
+/// fetch falls through to an empty render. The form submit
+/// path still works — the user lands on the real Google URL,
+/// just with no visible results.
 fn maybe_rewrite_google_search(url: &Url) -> Url {
     url.clone()
 }
