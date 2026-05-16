@@ -1233,7 +1233,59 @@ var window = {
     innerWidth: 1400,
     innerHeight: 900
 };
-var google = {};
+// `performance` is referenced by every modern page for `now()`
+// timing marks. We back it with `Date.now()` (a real Zinc
+// builtin) so user code observing a monotonic-ish clock
+// works; mark / measure / observer paths are no-ops.
+var performance = {
+    now: function() { return Date.now(); },
+    timeOrigin: 0,
+    mark: __noop,
+    measure: __noop,
+    getEntriesByName: function() { return []; },
+    getEntriesByType: function() { return []; },
+    clearMarks: __noop,
+    clearMeasures: __noop
+};
+// Defensive `_` stub. Google's inline-script bundle uses `_` as
+// a chunk-loader namespace before its real definition assigns
+// to it; a probing access like `_.foo` would crash with
+// `ReferenceError: _ is not defined` otherwise. Real
+// `var _ = …` later in the same scope shadows this fine.
+var _ = {};
+// Google's `google.*` namespace pre-populated with the timer +
+// chunk-loader shape its inline scripts touch before defining
+// real values. Each slot is a no-op or empty container that
+// silently accepts the typical `google.timers.load.t.X = Y`
+// assignments instead of throwing on undefined access.
+var google = {
+    kEI: '', kEXPI: '', kPS: '', kHL: 'en',
+    sn: '', c: {},
+    jsr: __noop,
+    tick: __noop,
+    log: __noop,
+    x: __noop,
+    erd: { jsr: 0, bv: 0, de: false, c: '' },
+    timers: { load: { t: {} } }
+};
+// `gapi` is the Google APIs client loader. Google's inline
+// bootstrap pre-allocates a `.load` stub before the real
+// gapi script overwrites it; without ours, `gapi.load(...)`
+// later in the page throws.
+var gapi = { load: __noop };
+// In real browsers `var foo` at top level aliases on the
+// global object so `window.foo` and `foo` are the same
+// reference. Zinc's `var` lives in a separate globals
+// table, so we wire the aliases explicitly: pages routinely
+// reach back through `window.google` / `window.performance`
+// to mutate state (e.g. `window.google.erd = {...}`), and
+// they break the moment the lookup returns `undefined`.
+window.google = google;
+window.performance = performance;
+window.gapi = gapi;
+window.location = location;
+window.history = history;
+window.navigator = navigator;
 var self = window;
 "#;
 
