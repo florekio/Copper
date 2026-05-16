@@ -1031,6 +1031,28 @@ var document = {
     }
 };
 function __noop() {}
+// setTimeout shim. We don't have a real timer queue; the common
+// pattern in real-world code is `setTimeout(fn, 0)` as a
+// microtask shim, which we honour by firing synchronously.
+// Non-zero delays are dropped — a future phase swaps this for a
+// per-tab timer queue drained between paint frames.
+function setTimeout(fn, ms) {
+    if ((ms || 0) <= 0 && typeof fn === 'function') {
+        try { fn(); } catch (e) {}
+    }
+    return 0;
+}
+function requestAnimationFrame(fn) {
+    if (typeof fn === 'function') {
+        try { fn(0); } catch (e) {}
+    }
+    return 0;
+}
+function queueMicrotask(fn) {
+    if (typeof fn === 'function') {
+        try { fn(); } catch (e) {}
+    }
+}
 // addEventListener wrapper — routes through the __addEventListener
 // host fn with the right target handle. `null` resolves to the
 // document root on the host side (so document.addEventListener and
@@ -1107,9 +1129,9 @@ var window = {
     navigator: navigator,
     history: history,
     fetch: fetch,
-    setTimeout: __noop,
+    setTimeout: setTimeout,
     clearTimeout: __noop,
-    requestAnimationFrame: __noop,
+    requestAnimationFrame: requestAnimationFrame,
     addEventListener: __ael,
     removeEventListener: __noop,
     innerWidth: 1400,
@@ -1411,6 +1433,28 @@ mod tests {
         collect_text(&d, first, &mut text);
         assert_eq!(text, "hi from js");
         assert!(ctx.dirty().load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn set_timeout_zero_fires_synchronously() {
+        // Phase 5: setTimeout(fn, 0) fires immediately. Non-zero
+        // delays are dropped. The common real-world pattern is
+        // `setTimeout(fn, 0)` as a microtask shim, which works.
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+        engine
+            .eval(
+                "var fired = 0; \
+                 var queued = 0; \
+                 setTimeout(function(){ fired = fired + 1; }, 0); \
+                 setTimeout(function(){ queued = queued + 1; }, 100);",
+            )
+            .expect("eval");
+        let (fired, _) = engine.eval_with_output("fired");
+        let (queued, _) = engine.eval_with_output("queued");
+        assert_eq!(fired, "1", "ms=0 should fire synchronously");
+        assert_eq!(queued, "0", "ms>0 is dropped in this phase");
     }
 
     #[test]
