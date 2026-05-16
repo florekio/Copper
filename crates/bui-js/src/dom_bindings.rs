@@ -430,6 +430,52 @@ impl BindingContext {
             }
         });
 
+        // `__formElements(formHandle)` returns a JS object whose
+        // keys are the `name` attribute of every form-control
+        // descendant (input, textarea, select, button, output,
+        // fieldset) and whose values are the host handles. The
+        // prelude wraps each handle into an Element wrapper so
+        // `form.elements.q.value` reads exactly like a real
+        // browser. Anonymous controls (no `name`) are skipped —
+        // matching the HTMLFormControlsCollection named-access
+        // surface, which is what Google's submit interceptor
+        // reaches for.
+        let s = shared.clone();
+        engine.register_host_fn("__formElements", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(vm.alloc_object());
+            };
+            let dom = s.lock().unwrap();
+            let Some(form_nid) = dom.node_for_handle(handle) else {
+                return Ok(vm.alloc_object());
+            };
+            let mut named: Vec<(String, Value)> = Vec::new();
+            {
+                let d = dom.doc_handle.lock().unwrap();
+                for nid in d.descendants(form_nid) {
+                    let Some(elem) = d.element(nid) else { continue };
+                    if !matches!(
+                        elem.name.as_str(),
+                        "input" | "textarea" | "select" | "button" | "output" | "fieldset"
+                    ) {
+                        continue;
+                    }
+                    let Some(name) = elem.get_attr("name") else { continue };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let Some(h) = dom.handle_for(nid) else { continue };
+                    named.push((name.to_string(), h));
+                }
+            }
+            drop(dom);
+            let obj = vm.alloc_object();
+            for (k, v) in &named {
+                vm.set_property(obj, k, *v);
+            }
+            Ok(obj)
+        });
+
         let s = shared.clone();
         engine.register_host_fn("__elemChildren", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else {
@@ -1090,7 +1136,41 @@ function _wrapElem(handle) {
                 listener(e);
             }, capture === true);
         },
-        removeEventListener: __noop
+        removeEventListener: __noop,
+        // Form-control value. For <input> reads the `value`
+        // attribute. For <textarea> reads the text content.
+        // Setter writes back through `setAttribute`. Doesn't
+        // yet observe the embedder's in-progress edit buffer
+        // — user-typed text isn't visible until the form
+        // submits and the embedder commits the typed value.
+        get value() {
+            var tag = __elemTagName(this._h);
+            if (tag === 'TEXTAREA') return __elemTextContent(this._h);
+            var v = __elemGetAttr(this._h, 'value');
+            return v == null ? '' : v;
+        },
+        set value(v) {
+            var tag = __elemTagName(this._h);
+            var s = v === undefined || v === null ? '' : String(v);
+            if (tag === 'TEXTAREA') {
+                __elemSetTextContent(this._h, s);
+            } else {
+                __elemSetAttr(this._h, 'value', s);
+            }
+        },
+        // form.elements — HTMLFormControlsCollection-shaped
+        // named-access map. `.q`, `.submitBtn`, etc. resolve
+        // to wrapped form-control elements. Built lazily on
+        // each access (cheap for the typical form; rebuild
+        // matches the spec's "live collection" semantics).
+        get elements() {
+            var raw = __formElements(this._h);
+            var out = {};
+            for (var k in raw) {
+                out[k] = _wrapElem(raw[k]);
+            }
+            return out;
+        }
     };
 }
 var document = {
@@ -1655,6 +1735,93 @@ mod tests {
             url_seen.lock().unwrap().as_deref(),
             Some("/api/x"),
         );
+    }
+
+    #[test]
+    fn form_elements_named_access_returns_wrapped_controls() {
+        // Google's submit interceptor reads `form.elements.q.value`
+        // — this test locks in that the named-access shape works
+        // for the typical inputs of a search form.
+        let mut engine = Engine::new();
+        let doc = wrapped_doc(
+            "<body><form id='f'>\
+                 <input name='q' value='hello'>\
+                 <input name='hidden' type='hidden' value='secret'>\
+                 <button type='submit' name='go'>Go</button>\
+             </form></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        let (q_value, _) = engine
+            .eval_with_output("document.querySelector('#f').elements.q.value");
+        assert_eq!(q_value, "hello");
+
+        let (hidden_value, _) = engine
+            .eval_with_output("document.querySelector('#f').elements.hidden.value");
+        assert_eq!(hidden_value, "secret");
+
+        // Named access for the submit button still resolves —
+        // button is a form control even when it's the trigger.
+        let (go_tag, _) = engine
+            .eval_with_output("document.querySelector('#f').elements.go.tagName");
+        assert_eq!(go_tag, "BUTTON");
+    }
+
+    #[test]
+    fn input_value_get_set_routes_through_value_attr() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc(
+            "<body><input id='i' name='q' value='start'></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        let (initial, _) = engine.eval_with_output("document.querySelector('#i').value");
+        assert_eq!(initial, "start");
+
+        engine
+            .eval("document.querySelector('#i').value = 'updated';")
+            .expect("eval");
+
+        // The setter writes through to the `value` attribute so
+        // a subsequent `form.elements.q.value` read sees the
+        // updated string. Verify via the DOM directly too.
+        let (after, _) = engine.eval_with_output("document.querySelector('#i').value");
+        assert_eq!(after, "updated");
+
+        let d = doc.lock().unwrap();
+        let input = d
+            .descendants(d.root)
+            .find(|n| d.element(*n).map(|e| e.name == "input").unwrap_or(false))
+            .expect("input");
+        assert_eq!(
+            d.element(input).and_then(|e| e.get_attr("value")),
+            Some("updated")
+        );
+    }
+
+    #[test]
+    fn textarea_value_routes_through_text_content() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc(
+            "<body><form><textarea name='q'>initial text</textarea></form></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        // <textarea>'s in-DOM value is its child text content,
+        // not a `value` attribute.
+        let (got, _) = engine
+            .eval_with_output("document.querySelector('form').elements.q.value");
+        assert_eq!(got, "initial text");
+
+        engine
+            .eval(
+                "document.querySelector('form').elements.q.value = 'replaced';",
+            )
+            .expect("eval");
+
+        let (after, _) = engine
+            .eval_with_output("document.querySelector('form').elements.q.value");
+        assert_eq!(after, "replaced");
     }
 
     #[test]
