@@ -71,6 +71,36 @@ is `Cannot read properties of undefined (reading 'call')`
 on a different code path, still inside the eval'd bundle
 but now several thousand lines deeper.
 
+### Where the remaining `/search` errors land
+
+After the lexer fix, two errors remain on `/search`:
+
+1. **Script #2 (62 KB self-decoder)**: `Cannot read
+   properties of undefined (reading 'call')` —
+   the eval'd bundle runs much further but eventually
+   tries `something.call(...)` on undefined. That's
+   typical of a missing-API path: real browsers would
+   resolve `something` to a built-in we don't expose.
+   Bisecting WHERE inside the bundle requires either
+   per-line instrumentation or a try/catch wrap.
+
+2. **Script #3 (26 KB)**: `ReferenceError: sctm is not
+   defined`. The script declares `var sctm = false` at
+   the top of its IIFE and reads it inside three nested
+   functions later. Standalone (no prelude) the script
+   throws `Error: a` (a different, explicit throw)
+   instead — so something our prelude installs breaks
+   the closure scope for `sctm`. Most likely a `var`
+   redeclaration / hoisting interaction with the
+   prelude's many globals. Investigation: A/B which
+   prelude block triggers the regression.
+
+Neither of these is a structural wall the way the regex
+bug was. Both are tractable trace-and-fix problems. The
+"page renders empty" state on `/search` continues until
+both clear (the bundle needs to actually paint DOM, which
+the inline scripts only do at the END of their flow).
+
 Tried (didn't work): pre-declaring `var J, K, M, …`
 globally as `undefined` in the prelude. The dispatcher
 writes through to those names via a pattern that conflicts
