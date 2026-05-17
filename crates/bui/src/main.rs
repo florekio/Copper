@@ -1820,6 +1820,28 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
     if let Some(bx) = &st.active_tab().layout {
         let mut page_dl = DisplayList::new();
         bui_layout::paint(bx, &mut page_dl);
+        // Empty-body fallback. Some pages (Google /search,
+        // Discord, Twitter, …) ship a fully JS-built UI — the
+        // raw HTML body has no rendered text, only a sea of
+        // <script> tags that assume a runtime we don't fully
+        // emulate yet (Closure-library, React with proper
+        // hydration, …). Detecting that *after* the script
+        // pass and *before* paint lets us replace a white
+        // viewport with a one-paragraph explanation pointing
+        // to the roadmap, so the user knows why nothing
+        // rendered instead of suspecting Copper crashed.
+        //
+        // Heuristic: zero Text commands emitted by the page
+        // means "no visible glyphs anywhere". Pages with even
+        // a single rendered character keep their natural
+        // paint.
+        let has_text = page_dl
+            .commands
+            .iter()
+            .any(|c| matches!(c, PaintCommand::Text { .. }));
+        if !has_text {
+            page_dl = build_empty_body_fallback(viewport_w_px, &active_url);
+        }
         let base_dy = CHROME_HEIGHT - scroll_y;
         // `position: sticky` defers its shift to here: bui-layout
         // emitted PushStickyGroup / PopStickyGroup bracket commands
@@ -2781,6 +2803,128 @@ fn empty_state(font: &bui_text::Font, msg: &str, x: f32, y: f32, dl: &mut Displa
 }
 
 // ---- IDE-Pane status line (bottom strip) ----
+
+/// Build a display list that explains why the body is empty.
+/// Triggered when the page produced no Text commands at all
+/// (Google /search, Discord, Twitter, … any "JS shell with
+/// nothing in the static HTML body"). Coordinates are in the
+/// page-paint space — the caller wraps this with the standard
+/// chrome offset.
+///
+/// Reads like a paragraph because that's the most accessible
+/// way to convey context: title, one-line explanation, the
+/// URL the user asked for, a pointer to the roadmap file.
+fn build_empty_body_fallback(viewport_w_px: f32, url: &str) -> DisplayList {
+    use bui_paint::{DisplayList, PaintCommand};
+
+    const TITLE_FS: f32 = 28.0;
+    const BODY_FS: f32 = 16.0;
+    const URL_FS: f32 = 14.0;
+    const LINE_GAP: f32 = 24.0;
+    const PARA_GAP: f32 = 16.0;
+
+    let font = bui_text::shared_font();
+    let pad_x = 48.0_f32.min(viewport_w_px * 0.08);
+    let inner_w = (viewport_w_px - pad_x * 2.0).max(200.0);
+    let mut dl = DisplayList::new();
+    let mut y = 80.0_f32;
+
+    // Title.
+    let title = "Nothing to render here.";
+    let title_w = font.measure_text(title, TITLE_FS);
+    dl.commands.push(PaintCommand::Text {
+        x: pad_x,
+        baseline: y + TITLE_FS,
+        advance: title_w,
+        font_size: TITLE_FS,
+        color: INK_2,
+        content: title.to_string(),
+    });
+    y += TITLE_FS + PARA_GAP;
+
+    // Body lines — flow text within `inner_w` so long
+    // explanations wrap. Hand-wrapped by word boundary.
+    let body_lines = [
+        "This page's content is built entirely by JavaScript Copper doesn't fully run yet.",
+        "Real-world examples: Google /search, Discord, Twitter, Maps. They ship a near-empty <body> and let a JS bundle (Closure-library, React, etc.) build the UI from scratch — Copper's JS engine handles inline scripts but doesn't run those bundles.",
+        "Pages whose HTML carries the real content (Wikipedia, GitHub, Hacker News, news sites) render fine. See docs/google-render-plan.md for the JS roadmap.",
+    ];
+    for paragraph in &body_lines {
+        for line in wrap_text_by_width(&font, paragraph, BODY_FS, inner_w) {
+            let advance = font.measure_text(&line, BODY_FS);
+            dl.commands.push(PaintCommand::Text {
+                x: pad_x,
+                baseline: y + BODY_FS,
+                advance,
+                font_size: BODY_FS,
+                color: INK_2,
+                content: line,
+            });
+            y += LINE_GAP;
+        }
+        y += PARA_GAP;
+    }
+
+    // URL footer — the address the request actually landed
+    // on, so the user can confirm the navigation happened and
+    // copy the URL elsewhere if they want to retry in a real
+    // browser.
+    let url_label = "Requested URL:";
+    let url_label_w = font.measure_text(url_label, URL_FS);
+    dl.commands.push(PaintCommand::Text {
+        x: pad_x,
+        baseline: y + URL_FS,
+        advance: url_label_w,
+        font_size: URL_FS,
+        color: INK_3,
+        content: url_label.to_string(),
+    });
+    y += LINE_GAP;
+    for line in wrap_text_by_width(&font, url, URL_FS, inner_w) {
+        let advance = font.measure_text(&line, URL_FS);
+        dl.commands.push(PaintCommand::Text {
+            x: pad_x,
+            baseline: y + URL_FS,
+            advance,
+            font_size: URL_FS,
+            color: INK_3,
+            content: line,
+        });
+        y += LINE_GAP;
+    }
+    dl
+}
+
+/// Simple word-wrap by measured pixel width. Words longer than
+/// `max_w` get a line to themselves (they overflow gracefully
+/// rather than being chopped mid-character — readability
+/// matters more than absolute compliance for an error page).
+fn wrap_text_by_width(
+    font: &bui_text::Font,
+    text: &str,
+    font_size: f32,
+    max_w: f32,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
+        if font.measure_text(&candidate, font_size) <= max_w || cur.is_empty() {
+            cur = candidate;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
 
 fn paint_status(width: f32, height: f32, url: &str, scroll_pct: u32, dl: &mut DisplayList) {
     let y = height - STATUS_HEIGHT;
