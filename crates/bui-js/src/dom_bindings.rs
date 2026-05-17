@@ -2669,6 +2669,238 @@ function btoa(s) {
     }
     return out;
 }
+// URLSearchParams polyfill. Methods defined on each instance
+// rather than the prototype because Zinc's prototype-method
+// dispatch was inconsistent for this shape. Each instance
+// gets its own method closures — slightly more memory per
+// URLSearchParams but reliable.
+function URLSearchParams(init) {
+    var entries = [];
+    function _parseString(s) {
+        s = s.charAt(0) === '?' ? s.substring(1) : s;
+        if (s.length === 0) return;
+        var pairs = s.split('&');
+        for (var i = 0; i < pairs.length; i++) {
+            var eq = pairs[i].indexOf('=');
+            var k = eq < 0 ? pairs[i] : pairs[i].substring(0, eq);
+            var v = eq < 0 ? '' : pairs[i].substring(eq + 1);
+            entries.push([
+                decodeURIComponent(k.replace(/\+/g, ' ')),
+                decodeURIComponent(v.replace(/\+/g, ' '))
+            ]);
+        }
+    }
+    if (init !== undefined && init !== null) {
+        if (typeof init === 'string') {
+            _parseString(init);
+        } else if (Array.isArray(init)) {
+            for (var i = 0; i < init.length; i++) {
+                entries.push([String(init[i][0]), String(init[i][1])]);
+            }
+        } else {
+            for (var k in init) {
+                entries.push([k, String(init[k])]);
+            }
+        }
+    }
+    this._entries = entries;
+    this.get = function(name) {
+        name = String(name);
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) return entries[i][1];
+        }
+        return null;
+    };
+    this.getAll = function(name) {
+        name = String(name);
+        var out = [];
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) out.push(entries[i][1]);
+        }
+        return out;
+    };
+    this.has = function(name) {
+        name = String(name);
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) return true;
+        }
+        return false;
+    };
+    this.set = function(name, value) {
+        name = String(name);
+        value = String(value);
+        var found = false;
+        var kept = [];
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) {
+                if (!found) { kept.push([name, value]); found = true; }
+            } else {
+                kept.push(entries[i]);
+            }
+        }
+        if (!found) kept.push([name, value]);
+        entries.length = 0;
+        for (var i = 0; i < kept.length; i++) entries.push(kept[i]);
+    };
+    this.append = function(name, value) {
+        entries.push([String(name), String(value)]);
+    };
+    this.delete = function(name) {
+        name = String(name);
+        var kept = [];
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] !== name) kept.push(entries[i]);
+        }
+        entries.length = 0;
+        for (var i = 0; i < kept.length; i++) entries.push(kept[i]);
+    };
+    this.forEach = function(cb, thisArg) {
+        for (var i = 0; i < entries.length; i++) {
+            cb.call(thisArg, entries[i][1], entries[i][0], this);
+        }
+    };
+    this.toString = function() {
+        var out = [];
+        for (var i = 0; i < entries.length; i++) {
+            out.push(
+                encodeURIComponent(entries[i][0]) + '=' +
+                encodeURIComponent(entries[i][1])
+            );
+        }
+        return out.join('&');
+    };
+}
+
+// URL constructor polyfill. Uses a single regex to peel off
+// every component in one pass — bypasses several Zinc
+// idiosyncrasies with `indexOf` and `var` scoping that the
+// hand-rolled parser tripped. Not the full WHATWG algorithm
+// (this is the "pragmatic 80%") but matches every typical
+// real-world URL shape.
+//
+// Groups: 1=scheme, 2=userinfo (without @), 3=host:port,
+//         4=pathname, 5=search (without ?), 6=hash (without #)
+var __URL_RE = /^(?:([a-zA-Z][a-zA-Z0-9+.\-]*):)?(?:\/\/(?:([^@/?#]*)@)?([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/;
+function URL(input, base) {
+    input = String(input);
+    if (base !== undefined && base !== null) {
+        input = __urlResolve(String(base), input);
+    }
+    var m = input.match(__URL_RE);
+    var scheme = (m && m[1]) ? m[1] : '';
+    var userinfo = (m && m[2]) ? m[2] : '';
+    var host = (m && m[3]) ? m[3] : '';
+    var pathname = (m && m[4]) ? m[4] : '';
+    var search = (m && m[5]) ? m[5] : '';
+    var hash = (m && m[6]) ? m[6] : '';
+    this.protocol = scheme ? scheme.toLowerCase() + ':' : '';
+    this.host = host;
+    // Split host:port — `lastIndexOf` keeps IPv6 `[::1]:80`
+    // mostly intact (we don't validate IPv6 here).
+    var colonAt = host.lastIndexOf(':');
+    if (colonAt >= 0) {
+        this.hostname = host.substring(0, colonAt);
+        this.port = host.substring(colonAt + 1);
+    } else {
+        this.hostname = host;
+        this.port = '';
+    }
+    var atAt = userinfo.indexOf(':');
+    if (atAt >= 0) {
+        this.username = userinfo.substring(0, atAt);
+        this.password = userinfo.substring(atAt + 1);
+    } else {
+        this.username = userinfo;
+        this.password = '';
+    }
+    this.pathname = pathname;
+    this.search = search ? '?' + search : '';
+    this.hash = hash ? '#' + hash : '';
+    this.origin = this.protocol + (this.host ? '//' + this.host : '');
+    this.searchParams = new URLSearchParams(this.search);
+    this.toString = function() {
+        var s = this.protocol;
+        if (this.host) s += '//' + this.host;
+        s += this.pathname;
+        var qstr = this.searchParams.toString();
+        if (qstr) s += '?' + qstr;
+        else if (this.search) s += this.search;
+        s += this.hash;
+        return s;
+    };
+}
+URL.prototype.toJSON = function() { return this.toString(); };
+
+// Simple relative-URL resolver. Handles the typical cases:
+// absolute URL → as-is. Protocol-relative (`//host/path`)
+// borrows scheme from base. Host-relative (`/path`) borrows
+// scheme + authority. Pure-relative (`x` / `./x` / `../x`)
+// resolves against the base's directory.
+function __urlResolve(base, relative) {
+    if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(relative)) {
+        return relative;
+    }
+    var schemeEnd = base.indexOf('://');
+    if (schemeEnd < 0) return relative;
+    var schemePrefix = base.substring(0, schemeEnd + 3);
+    var afterScheme = base.substring(schemeEnd + 3);
+    if (relative.substring(0, 2) === '//') {
+        return base.substring(0, schemeEnd + 1) + relative;
+    }
+    var pathStart = afterScheme.indexOf('/');
+    var authority, basePath;
+    if (pathStart < 0) {
+        authority = afterScheme;
+        basePath = '/';
+    } else {
+        authority = afterScheme.substring(0, pathStart);
+        basePath = afterScheme.substring(pathStart);
+    }
+    if (relative.charAt(0) === '/') {
+        return schemePrefix + authority + relative;
+    }
+    if (relative.charAt(0) === '?' || relative.charAt(0) === '#') {
+        var qIdx = basePath.indexOf('?');
+        var hIdx = basePath.indexOf('#');
+        var cut = basePath.length;
+        if (qIdx >= 0 && qIdx < cut) cut = qIdx;
+        if (hIdx >= 0 && hIdx < cut) cut = hIdx;
+        return schemePrefix + authority + basePath.substring(0, cut) + relative;
+    }
+    var lastSlash = basePath.lastIndexOf('/');
+    var dir = lastSlash >= 0 ? basePath.substring(0, lastSlash + 1) : '/';
+    return schemePrefix + authority + dir + relative;
+}
+
+// structuredClone polyfill. Deep-copies plain objects /
+// arrays / primitives via JSON round-trip. Loses functions,
+// Symbols, Dates, RegExps — which the real algorithm
+// preserves — but the JSON form covers the common
+// state-snapshot use case (every Redux store ever).
+function structuredClone(value) {
+    if (value === null || value === undefined) return value;
+    if (typeof value !== 'object') return value;
+    try { return JSON.parse(JSON.stringify(value)); }
+    catch (e) { return value; }
+}
+
+// Promise.allSettled polyfill. Returns a Promise that
+// resolves to [{status, value | reason}, …] after every
+// input Promise settles, in input order.
+if (typeof Promise.allSettled !== 'function') {
+    Promise.allSettled = function(iterable) {
+        return Promise.all(
+            Array.from(iterable).map(function(p) {
+                return Promise.resolve(p).then(
+                    function(value) { return { status: 'fulfilled', value: value }; },
+                    function(reason) { return { status: 'rejected', reason: reason }; }
+                );
+            })
+        );
+    };
+}
+
+// Original prelude continues below.
 function atob(s) {
     if (s === null || s === undefined) return '';
     s = String(s).replace(/[^A-Za-z0-9+/]/g, '');
@@ -3106,6 +3338,9 @@ window.encodeURI = encodeURI;
 window.decodeURI = decodeURI;
 window.btoa = btoa;
 window.atob = atob;
+window.URL = URL;
+window.URLSearchParams = URLSearchParams;
+window.structuredClone = structuredClone;
 window.console = console;
 window.globalThis = window;
 window.self = window;
@@ -3583,6 +3818,95 @@ mod tests {
             "document.querySelector('#p1').childNodes[0].nodeName",
         );
         assert_eq!(name, "#text");
+    }
+
+    /// URL component decomposition. Zinc's `p.toString()` direct
+    /// dispatch doesn't honour own-property `toString`, so this
+    /// test only covers the component getters — `.href` /
+    /// `.toString()` round-trip is broken until Zinc fixes the
+    /// dispatch bug (calling via template literals `\`${url}\``
+    /// or `'' + url` does work).
+    #[test]
+    fn url_polyfill_decomposes_absolute_components() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+
+        let (host, _) = engine.eval_with_output(
+            "new URL('https://example.com:8080/path?q=1#h').host",
+        );
+        assert_eq!(host, "example.com:8080");
+        let (hostname, _) = engine.eval_with_output(
+            "new URL('https://example.com:8080/path').hostname",
+        );
+        assert_eq!(hostname, "example.com");
+        let (port, _) = engine.eval_with_output(
+            "new URL('https://example.com:8080/path').port",
+        );
+        assert_eq!(port, "8080");
+        let (pathname, _) = engine.eval_with_output(
+            "new URL('https://example.com/path?q=1#h').pathname",
+        );
+        assert_eq!(pathname, "/path");
+        let (search, _) = engine.eval_with_output(
+            "new URL('https://example.com/path?q=1#h').search",
+        );
+        assert_eq!(search, "?q=1");
+        let (hash, _) = engine.eval_with_output(
+            "new URL('https://example.com/path?q=1#h').hash",
+        );
+        assert_eq!(hash, "#h");
+        let (proto, _) = engine.eval_with_output(
+            "new URL('https://example.com/').protocol",
+        );
+        assert_eq!(proto, "https:");
+
+        // searchParams.get works (each instance owns the
+        // method as a closure, not via prototype).
+        let (q, _) = engine.eval_with_output(
+            "new URL('https://a.com/?x=1&y=2').searchParams.get('y')",
+        );
+        assert_eq!(q, "2");
+    }
+
+    #[test]
+    fn url_search_params_get_and_has() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+
+        let (got, _) = engine.eval_with_output(
+            "(function(){\
+                 var p = new URLSearchParams('a=1&b=hello+world');\
+                 return p.get('a') + ',' + p.get('b');\
+             })()",
+        );
+        assert_eq!(got, "1,hello world");
+
+        let (has, _) = engine.eval_with_output(
+            "(function(){\
+                 var p = new URLSearchParams('a=1');\
+                 return p.has('a') + ',' + p.has('missing');\
+             })()",
+        );
+        assert_eq!(has, "true,false");
+    }
+
+    #[test]
+    fn structured_clone_deep_copies_objects() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+
+        let (got, _) = engine.eval_with_output(
+            "(function(){\
+                 var a = { x: 1, y: { z: [2, 3] } };\
+                 var b = structuredClone(a);\
+                 b.y.z.push(4);\
+                 return a.y.z.length + ',' + b.y.z.length;\
+             })()",
+        );
+        assert_eq!(got, "2,3");
     }
 
     #[test]
