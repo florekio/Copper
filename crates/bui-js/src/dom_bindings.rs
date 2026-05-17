@@ -115,6 +115,86 @@ impl DomShared {
     }
 }
 
+/// Queue a `MutationRecord` on every `MutationObserver`
+/// whose subscription matches the given target + kind.
+/// Records sit on each observer's `pending` queue until
+/// `JsContext::deliver_mutations` (called after each `tick`)
+/// hands them to the observer's callback.
+///
+/// Subscription matching:
+/// - kind must be enabled on the subscription
+///   (`childList: true` / `attributes: true` / `characterData:
+///   true`).
+/// - target must be `subscription.target` itself, OR a
+///   descendant of it when `subtree: true`.
+/// - for attribute records, `attributeFilter` (when present)
+///   limits which names match.
+fn record_mutation(
+    observers: &Arc<Mutex<MutationObservers>>,
+    doc_handle: &Arc<Mutex<Document>>,
+    record: MutationRecord,
+) {
+    let Ok(mut observers) = observers.lock() else { return };
+    if observers.is_empty() {
+        return;
+    }
+    let Ok(d) = doc_handle.lock() else { return };
+    for obs in observers.values_mut() {
+        for sub in &obs.subscriptions {
+            if !subscription_matches(sub, &record, &d) {
+                continue;
+            }
+            obs.pending.push(record.clone());
+            // One copy per observer regardless of how many of
+            // its subscriptions match — matches the spec.
+            break;
+        }
+    }
+}
+
+fn subscription_matches(
+    sub: &MutationSubscription,
+    record: &MutationRecord,
+    doc: &Document,
+) -> bool {
+    match record.kind {
+        MutationKind::Attributes => {
+            if !sub.attributes {
+                return false;
+            }
+            if let Some(filter) = &sub.attribute_filter
+                && !filter.iter().any(|n| n.eq_ignore_ascii_case(&record.attribute_name))
+            {
+                return false;
+            }
+        }
+        MutationKind::ChildList => {
+            if !sub.child_list {
+                return false;
+            }
+        }
+        MutationKind::CharacterData => {
+            if !sub.character_data {
+                return false;
+            }
+        }
+    }
+    if record.target == sub.target {
+        return true;
+    }
+    if !sub.subtree {
+        return false;
+    }
+    let mut cur = doc.node(record.target).parent;
+    while let Some(p) = cur {
+        if p == sub.target {
+            return true;
+        }
+        cur = doc.node(p).parent;
+    }
+    false
+}
+
 /// Convert a CSS / HTML kebab-case identifier (`font-size`,
 /// `data-foo-bar`) to JS camelCase (`fontSize`, `fooBar`).
 /// Each `-x` becomes `X`. Used by the `dataset` getter to
@@ -216,6 +296,58 @@ pub(crate) struct ScheduledTimer {
 /// first paint.
 pub type LayoutFrames = std::collections::HashMap<NodeId, (f32, f32, f32, f32)>;
 
+/// One pending MutationRecord queued for a `MutationObserver`.
+/// The observer's callback is invoked with a JS array of these
+/// records (mapped from Rust → JS in the deliver step) after
+/// every microtask drain.
+#[derive(Debug, Clone)]
+pub(crate) struct MutationRecord {
+    pub kind: MutationKind,
+    pub target: NodeId,
+    /// Attribute name for `attributes` records, empty for the
+    /// childList shape.
+    pub attribute_name: String,
+    /// Previous attribute value when the observer subscribed
+    /// with `attributeOldValue: true`. Empty otherwise.
+    pub old_value: String,
+    pub added: Vec<NodeId>,
+    pub removed: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationKind {
+    Attributes,
+    ChildList,
+    CharacterData,
+}
+
+/// What a `MutationObserver` observes. Stored verbatim from the
+/// `observe(target, init)` call so the matcher can decide each
+/// record's relevance.
+#[derive(Debug, Clone)]
+pub(crate) struct MutationSubscription {
+    pub target: NodeId,
+    pub subtree: bool,
+    pub child_list: bool,
+    pub attributes: bool,
+    pub character_data: bool,
+    pub attribute_old_value: bool,
+    pub attribute_filter: Option<Vec<String>>,
+}
+
+/// One registered observer — its callback Value plus every
+/// `observe(target, init)` call's subscription. A single
+/// `MutationObserver` can be `observe`d on multiple targets;
+/// records collected across all subscriptions are delivered
+/// together in one callback invocation.
+pub(crate) struct MutationObserver {
+    pub callback: zinc::runtime::value::Value,
+    pub subscriptions: Vec<MutationSubscription>,
+    pub pending: Vec<MutationRecord>,
+}
+
+pub(crate) type MutationObservers = std::collections::HashMap<u32, MutationObserver>;
+
 pub struct BindingContext {
     shared: Arc<Mutex<DomShared>>,
     elem_tag: HostTag,
@@ -233,6 +365,12 @@ pub struct BindingContext {
     /// same answer real browsers give for a detached or
     /// not-yet-painted element.
     layout_frames: Arc<Mutex<LayoutFrames>>,
+    /// Registered MutationObservers. Mutating bindings
+    /// (setAttribute, appendChild, …) consult this and queue
+    /// records on every observer whose subscription matches.
+    /// Records deliver as a batched JS-array callback after
+    /// `JsContext::tick` drains microtasks.
+    observers: Arc<Mutex<MutationObservers>>,
     /// URL JS asked us to navigate to via `location.href = ...` (or
     /// `location.assign(...)` / `location.replace(...)`). Drained
     /// once by the embedder after the script pass completes.
@@ -306,11 +444,20 @@ impl BindingContext {
         }
 
         let dirty = Arc::new(AtomicBool::new(false));
+        // Keep a stand-alone Arc clone of the document for the
+        // mutation-observer plumbing, since `doc` itself is
+        // about to move into `DomShared`. Cheap — every clone
+        // is a refcount bump.
+        let doc_for_observers = doc.clone();
         let shared = Arc::new(Mutex::new(DomShared {
             doc_handle: doc,
             handles_by_node,
             dirty: dirty.clone(),
         }));
+        let observers: Arc<Mutex<MutationObservers>> =
+            Arc::new(Mutex::new(MutationObservers::new()));
+        let next_observer_id =
+            Arc::new(std::sync::atomic::AtomicU32::new(1));
 
         // ----- Read side -----
 
@@ -1004,6 +1151,14 @@ impl BindingContext {
         // ----- Write side (Tier 1 §1) -----
 
         let s = shared.clone();
+        // For attribute / childList mutations we capture the
+        // pre-mutation state inside the existing locked
+        // section, then drop locks and call `record_mutation`
+        // afterwards. Calling it under the doc lock would
+        // re-enter the same Mutex when a MutationObserver
+        // callback later reads the DOM via a host fn.
+        let observers_for_set = observers.clone();
+        let doc_for_set = doc_for_observers.clone();
         engine.register_host_fn("__elemSetAttr", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else {
                 return Ok(Value::undefined());
@@ -1016,17 +1171,37 @@ impl BindingContext {
             let Some(nid) = dom.node_for_handle(handle) else {
                 return Ok(Value::undefined());
             };
-            {
+            let old_value = {
                 let mut d = dom.doc_handle.lock().unwrap();
+                let prev = d
+                    .element(nid)
+                    .and_then(|e| e.get_attr(&name).map(|s| s.to_string()))
+                    .unwrap_or_default();
                 if let Some(elem) = d.element_mut(nid) {
                     elem.set_attr(&name, &value);
                 }
-            }
+                prev
+            };
             dom.mark_dirty();
+            drop(dom);
+            record_mutation(
+                &observers_for_set,
+                &doc_for_set,
+                MutationRecord {
+                    kind: MutationKind::Attributes,
+                    target: nid,
+                    attribute_name: name.clone(),
+                    old_value,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                },
+            );
             Ok(Value::undefined())
         });
 
         let s = shared.clone();
+        let observers_for_remove = observers.clone();
+        let doc_for_remove = doc_for_observers.clone();
         engine.register_host_fn("__elemRemoveAttr", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else {
                 return Ok(Value::undefined());
@@ -1038,21 +1213,40 @@ impl BindingContext {
             let Some(nid) = dom.node_for_handle(handle) else {
                 return Ok(Value::undefined());
             };
-            let changed;
-            {
+            let (changed, old_value) = {
                 let mut d = dom.doc_handle.lock().unwrap();
-                changed = d
+                let prev = d
+                    .element(nid)
+                    .and_then(|e| e.get_attr(&name).map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let changed = d
                     .element_mut(nid)
                     .map(|e| e.remove_attr(&name))
                     .unwrap_or(false);
-            }
+                (changed, prev)
+            };
             if changed {
                 dom.mark_dirty();
+                drop(dom);
+                record_mutation(
+                    &observers_for_remove,
+                    &doc_for_remove,
+                    MutationRecord {
+                        kind: MutationKind::Attributes,
+                        target: nid,
+                        attribute_name: name.clone(),
+                        old_value,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                    },
+                );
             }
             Ok(Value::undefined())
         });
 
         let s = shared.clone();
+        let observers_for_text = observers.clone();
+        let doc_for_text = doc_for_observers.clone();
         engine.register_host_fn("__elemSetTextContent", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else {
                 return Ok(Value::undefined());
@@ -1067,10 +1261,30 @@ impl BindingContext {
                 d.set_text_content(nid, &text);
             }
             dom.mark_dirty();
+            drop(dom);
+            // textContent reset emits a single childList record
+            // — modeled as "every previous child removed, one
+            // text child added" elsewhere, but a single record
+            // with no added/removed lists is the minimum every
+            // observer expects.
+            record_mutation(
+                &observers_for_text,
+                &doc_for_text,
+                MutationRecord {
+                    kind: MutationKind::ChildList,
+                    target: nid,
+                    attribute_name: String::new(),
+                    old_value: String::new(),
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                },
+            );
             Ok(Value::undefined())
         });
 
         let s = shared.clone();
+        let observers_for_append = observers.clone();
+        let doc_for_append = doc_for_observers.clone();
         engine.register_host_fn("__elemAppendChild", move |_vm, _this, args| {
             let Some(parent_h) = args.first().copied() else {
                 return Ok(Value::undefined());
@@ -1090,10 +1304,25 @@ impl BindingContext {
                 d.append_child(parent, child);
             }
             dom.mark_dirty();
+            drop(dom);
+            record_mutation(
+                &observers_for_append,
+                &doc_for_append,
+                MutationRecord {
+                    kind: MutationKind::ChildList,
+                    target: parent,
+                    attribute_name: String::new(),
+                    old_value: String::new(),
+                    added: vec![child],
+                    removed: Vec::new(),
+                },
+            );
             Ok(child_h)
         });
 
         let s = shared.clone();
+        let observers_for_rm = observers.clone();
+        let doc_for_rm = doc_for_observers.clone();
         engine.register_host_fn("__elemRemoveChild", move |_vm, _this, args| {
             let Some(parent_h) = args.first().copied() else {
                 return Ok(Value::undefined());
@@ -1102,7 +1331,7 @@ impl BindingContext {
                 return Ok(Value::undefined());
             };
             let dom = s.lock().unwrap();
-            let Some(_parent) = dom.node_for_handle(parent_h) else {
+            let Some(parent) = dom.node_for_handle(parent_h) else {
                 return Ok(Value::undefined());
             };
             let Some(child) = dom.node_for_handle(child_h) else {
@@ -1115,6 +1344,19 @@ impl BindingContext {
                 d.detach(child);
             }
             dom.mark_dirty();
+            drop(dom);
+            record_mutation(
+                &observers_for_rm,
+                &doc_for_rm,
+                MutationRecord {
+                    kind: MutationKind::ChildList,
+                    target: parent,
+                    attribute_name: String::new(),
+                    old_value: String::new(),
+                    added: Vec::new(),
+                    removed: vec![child],
+                },
+            );
             Ok(child_h)
         });
 
@@ -1330,6 +1572,95 @@ impl BindingContext {
             Ok(Value::null())
         });
 
+        // ---- MutationObserver registry ----
+        //
+        // `__newMutationObserver(callback)` allocates an entry
+        // and returns an opaque numeric id the prelude stores
+        // on the JS-side observer object. `__moObserve(id,
+        // target, init)` adds a subscription; `__moDisconnect(id)`
+        // drops the entry entirely. Records queued by mutating
+        // host fns deliver via `JsContext::deliver_mutations`,
+        // called from `tick`.
+        let observers_for_new = observers.clone();
+        let id_for_new = next_observer_id.clone();
+        engine.register_host_fn("__newMutationObserver", move |_vm, _this, args| {
+            let Some(cb) = args.first().copied() else { return Ok(Value::int(0)) };
+            if !cb.is_function() && !cb.is_object() {
+                return Ok(Value::int(0));
+            }
+            let id = id_for_new.fetch_add(1, Ordering::SeqCst);
+            observers_for_new.lock().unwrap().insert(
+                id,
+                MutationObserver {
+                    callback: cb,
+                    subscriptions: Vec::new(),
+                    pending: Vec::new(),
+                },
+            );
+            Ok(Value::int(id as i32))
+        });
+
+        let observers_for_obs = observers.clone();
+        let shared_for_obs = shared.clone();
+        engine.register_host_fn("__moObserve", move |vm, _this, args| {
+            let Some(id) = args.first().and_then(|v| v.as_number()) else {
+                return Ok(Value::null());
+            };
+            let id = id as u32;
+            let Some(target_h) = args.get(1).copied() else { return Ok(Value::null()) };
+            let Some(target_nid) =
+                shared_for_obs.lock().unwrap().node_for_handle(target_h)
+            else {
+                return Ok(Value::null());
+            };
+            let init = args.get(2).copied().unwrap_or(Value::null());
+            let read_bool = |vm: &mut zinc::vm::vm::Vm, name: &str| -> bool {
+                vm.get_property(init, name)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            };
+            let subtree = read_bool(vm, "subtree");
+            let child_list = read_bool(vm, "childList");
+            let attributes = read_bool(vm, "attributes");
+            let character_data = read_bool(vm, "characterData");
+            let attribute_old_value = read_bool(vm, "attributeOldValue");
+            // `attributeFilter: ['data-foo', …]`: read each
+            // element via indexed property access.
+            let attribute_filter = vm.get_property(init, "attributeFilter").and_then(|filter| {
+                let len = vm
+                    .get_property(filter, "length")
+                    .and_then(|v| v.as_number())?;
+                let mut out = Vec::with_capacity(len as usize);
+                for i in 0..(len as usize) {
+                    let elem = vm.get_property(filter, &i.to_string())?;
+                    let s = read_str(vm, Some(&elem))?;
+                    out.push(s);
+                }
+                Some(out)
+            });
+            if let Some(obs) = observers_for_obs.lock().unwrap().get_mut(&id) {
+                obs.subscriptions.push(MutationSubscription {
+                    target: target_nid,
+                    subtree,
+                    child_list,
+                    attributes,
+                    character_data,
+                    attribute_old_value,
+                    attribute_filter,
+                });
+            }
+            Ok(Value::null())
+        });
+
+        let observers_for_dis = observers.clone();
+        engine.register_host_fn("__moDisconnect", move |_vm, _this, args| {
+            let Some(id) = args.first().and_then(|v| v.as_number()) else {
+                return Ok(Value::null());
+            };
+            observers_for_dis.lock().unwrap().remove(&(id as u32));
+            Ok(Value::null())
+        });
+
         // ---- Layout geometry ----
         //
         // `__elemFrame(handle)` returns the (x, y, w, h) the
@@ -1487,6 +1818,7 @@ impl BindingContext {
             stop_propagation_fn,
             timers,
             layout_frames,
+            observers,
         }
     }
 
@@ -1548,6 +1880,34 @@ impl BindingContext {
     /// each layout pass; reads from JS go through `__elemFrame`.
     pub fn layout_frames(&self) -> Arc<Mutex<LayoutFrames>> {
         self.layout_frames.clone()
+    }
+
+    /// Registered MutationObservers, keyed by opaque id.
+    /// `JsContext::deliver_mutations` walks these after each
+    /// `tick` and invokes any observer whose `pending` queue
+    /// has accumulated records.
+    pub(crate) fn observers(&self) -> Arc<Mutex<MutationObservers>> {
+        self.observers.clone()
+    }
+
+    /// Side-table NodeId → host handle. Used by
+    /// `JsContext::deliver_mutations` when building the
+    /// `target` / `addedNodes` / `removedNodes` fields of a
+    /// JS-side MutationRecord — we re-use the wrapped element
+    /// when one exists, else ask the VM to allocate.
+    pub(crate) fn elem_tag_raw(&self) -> u32 {
+        self.elem_tag.0
+    }
+
+    /// Resolve a NodeId to its host handle, allocating lazily
+    /// if needed. Used by mutation-record delivery.
+    pub(crate) fn ensure_handle_for(
+        &self,
+        nid: NodeId,
+        vm: &mut zinc::vm::vm::Vm,
+    ) -> Value {
+        let mut dom = self.shared.lock().unwrap();
+        dom.ensure_handle(Some(nid), vm, self.elem_tag)
     }
 
     /// Build a fresh `EventDispatchCtx` for one dispatch — the
@@ -2111,21 +2471,24 @@ var _ = {};
 // real values. Each slot is a no-op or empty container that
 // silently accepts the typical `google.timers.load.t.X = Y`
 // assignments instead of throwing on undefined access.
-// MutationObserver / IntersectionObserver / ResizeObserver
-// stubs. Real implementations would (a) track the (target,
-// options) registrations and (b) emit records on every DOM
-// mutation / layout pass. We don't wire either today; the
-// constructor returns an object with the expected methods so
-// pages that probe `typeof MutationObserver === 'function'`
-// and then call `.observe(target, …)` survive. Callbacks
-// never fire — pages that *depend* on a record being emitted
-// (live-update widgets, lazy images) won't work, but they
-// also won't crash; failing as "static" is preferable to
-// failing as "throw".
-function MutationObserver(_cb) {
+// MutationObserver — real wiring. Each `new MutationObserver(cb)`
+// registers `cb` with the host's observer registry; the host
+// queues records on every DOM mutation that matches a
+// subscription. Delivery happens after each `JsContext::tick`
+// drains microtasks. IntersectionObserver / ResizeObserver
+// stay no-ops below — those need a layout-tick integration
+// that's not built yet.
+function MutationObserver(cb) {
+    var id = __newMutationObserver(cb);
     return {
-        observe: __noop,
-        disconnect: __noop,
+        _id: id,
+        observe: function(target, init) {
+            if (!target) return;
+            __moObserve(this._id, target._h, init || {});
+        },
+        disconnect: function() {
+            __moDisconnect(this._id);
+        },
         takeRecords: function() { return []; }
     };
 }

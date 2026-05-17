@@ -241,6 +241,9 @@ impl JsContext {
         // runs — equivalent to the browser's "run a JS task,
         // then microtasks" abstraction.
         let _ = self.engine.vm().drain_microtasks();
+        // Deliver any MutationObserver records the handler
+        // produced (or that earlier mutations left pending).
+        self.deliver_mutations();
         out
     }
 
@@ -250,6 +253,124 @@ impl JsContext {
     /// frames.
     pub fn drain_microtasks(&mut self) {
         let _ = self.engine.vm().drain_microtasks();
+    }
+
+    /// Deliver every `MutationObserver` callback whose
+    /// `pending` queue has records since the last delivery.
+    /// Each call hands the observer a JS array of
+    /// MutationRecord-shaped objects (`{ type, target,
+    /// attributeName, oldValue, addedNodes, removedNodes }`)
+    /// and clears its queue.
+    ///
+    /// Loop: a callback may mutate the DOM, queueing more
+    /// records on the *same* observer (or any other). We
+    /// re-drain until no observer has anything pending or we
+    /// hit an iteration cap (defends against pathological
+    /// observe-yourself loops).
+    pub fn deliver_mutations(&mut self) {
+        let observers = self.bindings.observers();
+        let elem_tag = self.bindings.elem_tag_raw();
+        let _ = elem_tag; // referenced via ensure_handle_for
+        const MAX_ITERATIONS: usize = 32;
+        for _ in 0..MAX_ITERATIONS {
+            // Snapshot which observers have pending records,
+            // and drain each. Build the JS payload AFTER
+            // dropping the observers lock so callbacks can
+            // call observe/disconnect without deadlocking.
+            let batches: Vec<(zinc::runtime::value::Value, Vec<crate::dom_bindings::MutationRecord>)> = {
+                let mut obs = observers.lock().unwrap();
+                let mut out = Vec::new();
+                for entry in obs.values_mut() {
+                    if entry.pending.is_empty() {
+                        continue;
+                    }
+                    out.push((entry.callback, std::mem::take(&mut entry.pending)));
+                }
+                out
+            };
+            if batches.is_empty() {
+                break;
+            }
+            for (callback, records) in batches {
+                // Build the JS array of MutationRecord objects.
+                let mut js_records: Vec<zinc::runtime::value::Value> =
+                    Vec::with_capacity(records.len());
+                for rec in &records {
+                    let vm = self.engine.vm();
+                    let obj = vm.alloc_object();
+                    let kind_str = match rec.kind {
+                        crate::dom_bindings::MutationKind::Attributes => "attributes",
+                        crate::dom_bindings::MutationKind::ChildList => "childList",
+                        crate::dom_bindings::MutationKind::CharacterData => "characterData",
+                    };
+                    let ks = vm.value_from_str(kind_str);
+                    vm.set_property(obj, "type", ks);
+                    let target_h = self.bindings.ensure_handle_for(rec.target, self.engine.vm());
+                    self.engine.vm().set_property(obj, "target", target_h);
+                    if !rec.attribute_name.is_empty() {
+                        let vm = self.engine.vm();
+                        let n = vm.value_from_str(&rec.attribute_name);
+                        vm.set_property(obj, "attributeName", n);
+                    } else {
+                        self.engine.vm().set_property(
+                            obj,
+                            "attributeName",
+                            zinc::runtime::value::Value::null(),
+                        );
+                    }
+                    if !rec.old_value.is_empty() {
+                        let vm = self.engine.vm();
+                        let v = vm.value_from_str(&rec.old_value);
+                        vm.set_property(obj, "oldValue", v);
+                    } else {
+                        self.engine.vm().set_property(
+                            obj,
+                            "oldValue",
+                            zinc::runtime::value::Value::null(),
+                        );
+                    }
+                    // addedNodes / removedNodes as arrays of
+                    // wrapped element handles.
+                    let mut added_vals = Vec::with_capacity(rec.added.len());
+                    for nid in &rec.added {
+                        let h = self.bindings.ensure_handle_for(*nid, self.engine.vm());
+                        added_vals.push(h);
+                    }
+                    let added_arr = self.engine.vm().alloc_array(added_vals);
+                    self.engine.vm().set_property(obj, "addedNodes", added_arr);
+                    let mut removed_vals = Vec::with_capacity(rec.removed.len());
+                    for nid in &rec.removed {
+                        let h = self.bindings.ensure_handle_for(*nid, self.engine.vm());
+                        removed_vals.push(h);
+                    }
+                    let removed_arr = self.engine.vm().alloc_array(removed_vals);
+                    self.engine.vm().set_property(obj, "removedNodes", removed_arr);
+                    js_records.push(obj);
+                }
+                let records_arr = self.engine.vm().alloc_array(js_records);
+                // Call the observer with (records, observer).
+                // We pass `null` for the second argument
+                // because we don't yet have a Value-shaped
+                // handle to the JS-side observer object — the
+                // common access pattern is `function(records)`,
+                // so this is rarely consulted.
+                if self
+                    .engine
+                    .vm()
+                    .host_call(callback, &[records_arr])
+                    .is_err()
+                {
+                    self.engine
+                        .vm()
+                        .output
+                        .push("Uncaught exception in MutationObserver callback".into());
+                }
+            }
+            // After all callbacks ran, drain microtasks once
+            // — the callback bodies may have queued Promise
+            // continuations.
+            let _ = self.engine.vm().drain_microtasks();
+        }
     }
 
     /// Publish per-NodeId layout frames so JS reads of
@@ -334,6 +455,10 @@ impl JsContext {
             }
         }
         let _ = self.engine.vm().drain_microtasks();
+        // Any DOM mutations from timers also fan out to
+        // MutationObservers — same shape as event-handler
+        // mutations.
+        self.deliver_mutations();
     }
 
     /// Return — and consume — every console line the VM has
@@ -604,6 +729,86 @@ mod tests {
         // And we observe the side-effect of the handler running.
         let (fired, _) = ctx.engine.eval_with_output("fired");
         assert_eq!(fired, "1");
+    }
+
+    /// MutationObserver fires real records — setAttribute on an
+    /// observed subtree queues an `attributes` record; appendChild
+    /// queues a `childList` record. Was: stub that never fired.
+    #[test]
+    fn mutation_observer_fires_on_set_attribute() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let div = d.create_element("div");
+        d.element_mut(div).unwrap().set_attr("id", "d");
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, div);
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "globalThis.records = [];\n\
+             var mo = new MutationObserver(function(recs){\n\
+                 for (var i = 0; i < recs.length; i++) {\n\
+                     globalThis.records.push(recs[i].type + ':' + recs[i].attributeName);\n\
+                 }\n\
+             });\n\
+             mo.observe(document.querySelector('#d'), { attributes: true, attributeOldValue: true });\n\
+             document.querySelector('#d').setAttribute('data-foo', 'bar');\n\
+             document.querySelector('#d').setAttribute('data-baz', 'qux');",
+        );
+        d.append_child(d.root, html); // ensure html attached
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+
+        // Records delivered after the script ran (load event
+        // dispatch + microtask drain). Two setAttribute calls
+        // → two records.
+        let (got, _) = ctx
+            .engine
+            .eval_with_output("records.join(',')");
+        assert_eq!(got, "attributes:data-foo,attributes:data-baz");
+    }
+
+    /// MutationObserver fires `childList` records on
+    /// appendChild + removeChild. Verifies the observed
+    /// target is the *parent*, with the added/removed
+    /// children populating addedNodes / removedNodes.
+    #[test]
+    fn mutation_observer_fires_on_child_list() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let parent = d.create_element("div");
+        d.element_mut(parent).unwrap().set_attr("id", "p");
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, parent);
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "globalThis.log = [];\n\
+             var mo = new MutationObserver(function(recs){\n\
+                 for (var i = 0; i < recs.length; i++) {\n\
+                     var r = recs[i];\n\
+                     globalThis.log.push(r.type + ':+'+r.addedNodes.length+'-'+r.removedNodes.length);\n\
+                 }\n\
+             });\n\
+             mo.observe(document.querySelector('#p'), { childList: true });\n\
+             var span = document.createElement('span');\n\
+             document.querySelector('#p').appendChild(span);\n\
+             document.querySelector('#p').removeChild(span);",
+        );
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        let (got, _) = ctx.engine.eval_with_output("log.join(',')");
+        assert_eq!(got, "childList:+1-0,childList:+0-1");
     }
 
     /// `getBoundingClientRect()` returns the geometry the
