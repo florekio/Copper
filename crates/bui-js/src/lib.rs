@@ -20,6 +20,7 @@
 //!   * `dirty` flag tripped by mutating bindings; orchestrator re-runs
 //!     style + layout when set.
 
+pub mod closure_shim;
 pub mod dom_bindings;
 pub mod events;
 
@@ -174,7 +175,16 @@ impl JsContext {
 
         let mut outcomes = Vec::with_capacity(scripts.len());
         for (node, source) in scripts {
-            let (result, mut output) = engine.eval_with_output(&source);
+            // First-cut Phase 19 (docs/google-render-plan.md):
+            // detect Closure-compiler IIFEs and inject a
+            // namespace stub so the `_.X` cascade no longer
+            // throws on every access. The bundle still won't
+            // render Google's results — real Closure runtime is
+            // a multi-week vendoring task — but defusing the
+            // error cascade is real progress toward the
+            // eventual proper fix.
+            let rewritten = closure_shim::maybe_inject(&source);
+            let (result, mut output) = engine.eval_with_output(&rewritten);
             if is_script_error(&result) {
                 output.push(format!("Uncaught {result}"));
             }

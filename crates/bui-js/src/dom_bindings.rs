@@ -2342,7 +2342,20 @@ var document = {
     title: '',
     URL: '',
     referrer: '',
-    cookie: ''
+    cookie: '',
+    // FontFaceSet stub. `document.fonts.load(font, text)` is
+    // used by Google's preload path and lots of icon-font
+    // libraries. Returns a resolved Promise — the page proceeds
+    // as if the font loaded. `ready` is a forever-resolved
+    // Promise. `check(font)` returns true so style queries
+    // that gate on font availability take the happy path.
+    fonts: {
+        load: function() { return Promise.resolve([]); },
+        check: function() { return true; },
+        ready: Promise.resolve(),
+        forEach: __noop,
+        size: 0
+    }
 };
 function __noop() {}
 // Timer scheduling now routes through host fns that push onto
@@ -2577,7 +2590,21 @@ var google = {
     log: __noop,
     x: __noop,
     erd: { jsr: 0, bv: 0, de: false, c: '' },
-    timers: { load: { t: {} } }
+    timers: { load: { t: {} } },
+    // `stvsc: true` is the load-bearing flag. Google's first
+    // inline script does
+    //   ((a=window.google)==null ? 0 : a.stvsc) ?
+    //       google.kEI = _g.kEI :
+    //       window.google = _g;
+    // Without stvsc set, the *else* branch runs: window.google
+    // is replaced wholesale with `_g` (which carries kEI,
+    // kEXPI, kBL, kOPI — and lacks the `erd` / `timers` shape
+    // every later script reads). With stvsc set, the *then*
+    // branch runs and our object is preserved, just merging
+    // the new kEI in. Cuts the "Cannot read 'jsr' of
+    // undefined" / "'load' of undefined" cascade off at the
+    // root.
+    stvsc: true
 };
 // `gapi` is the Google APIs client loader. Google's inline
 // bootstrap pre-allocates a `.load` stub before the real
