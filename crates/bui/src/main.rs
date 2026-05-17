@@ -2898,116 +2898,32 @@ fn collect_layout_frames(
 /// Reads like a paragraph because that's the most accessible
 /// way to convey context: title, one-line explanation, the
 /// URL the user asked for, a pointer to the roadmap file.
-fn build_empty_body_fallback(viewport_w_px: f32, url: &str) -> DisplayList {
+fn build_empty_body_fallback(viewport_w_px: f32, _url: &str) -> DisplayList {
     use bui_paint::{DisplayList, PaintCommand};
 
-    const TITLE_FS: f32 = 28.0;
-    const BODY_FS: f32 = 16.0;
-    const URL_FS: f32 = 14.0;
-    const LINE_GAP: f32 = 24.0;
-    const PARA_GAP: f32 = 16.0;
-
+    // Single quiet line near the top — no lecture, no
+    // synthesized overlay covering the page. Users who see
+    // it understand the navigation succeeded but the page
+    // body is empty. The full explanation moved to
+    // `docs/google-render-plan.md` and the dev-dock Console
+    // (where the per-script errors already land).
+    const FS: f32 = 13.0;
     let font = bui_text::shared_font();
-    let pad_x = 48.0_f32.min(viewport_w_px * 0.08);
-    let inner_w = (viewport_w_px - pad_x * 2.0).max(200.0);
+    let pad_x = 16.0_f32;
     let mut dl = DisplayList::new();
-    let mut y = 80.0_f32;
-
-    // Title.
-    let title = "Nothing to render here.";
-    let title_w = font.measure_text(title, TITLE_FS);
+    let msg = "(page body is empty — see dev-dock Console for script errors)";
+    let advance = font.measure_text(msg, FS);
+    // Center horizontally; place near the top.
+    let x = ((viewport_w_px - advance) * 0.5).max(pad_x);
     dl.commands.push(PaintCommand::Text {
-        x: pad_x,
-        baseline: y + TITLE_FS,
-        advance: title_w,
-        font_size: TITLE_FS,
-        color: INK_2,
-        content: title.to_string(),
-    });
-    y += TITLE_FS + PARA_GAP;
-
-    // Body lines — flow text within `inner_w` so long
-    // explanations wrap. Hand-wrapped by word boundary.
-    let body_lines = [
-        "This page's content is built entirely by JavaScript Copper doesn't fully run yet.",
-        "Real-world examples: Google /search, Discord, Twitter, Maps. They ship a near-empty <body> and let a JS bundle (Closure-library, React, etc.) build the UI from scratch — Copper's JS engine handles inline scripts but doesn't run those bundles.",
-        "Pages whose HTML carries the real content (Wikipedia, GitHub, Hacker News, news sites) render fine. See docs/google-render-plan.md for the JS roadmap.",
-    ];
-    for paragraph in &body_lines {
-        for line in wrap_text_by_width(&font, paragraph, BODY_FS, inner_w) {
-            let advance = font.measure_text(&line, BODY_FS);
-            dl.commands.push(PaintCommand::Text {
-                x: pad_x,
-                baseline: y + BODY_FS,
-                advance,
-                font_size: BODY_FS,
-                color: INK_2,
-                content: line,
-            });
-            y += LINE_GAP;
-        }
-        y += PARA_GAP;
-    }
-
-    // URL footer — the address the request actually landed
-    // on, so the user can confirm the navigation happened and
-    // copy the URL elsewhere if they want to retry in a real
-    // browser.
-    let url_label = "Requested URL:";
-    let url_label_w = font.measure_text(url_label, URL_FS);
-    dl.commands.push(PaintCommand::Text {
-        x: pad_x,
-        baseline: y + URL_FS,
-        advance: url_label_w,
-        font_size: URL_FS,
+        x,
+        baseline: 40.0,
+        advance,
+        font_size: FS,
         color: INK_3,
-        content: url_label.to_string(),
+        content: msg.to_string(),
     });
-    y += LINE_GAP;
-    for line in wrap_text_by_width(&font, url, URL_FS, inner_w) {
-        let advance = font.measure_text(&line, URL_FS);
-        dl.commands.push(PaintCommand::Text {
-            x: pad_x,
-            baseline: y + URL_FS,
-            advance,
-            font_size: URL_FS,
-            color: INK_3,
-            content: line,
-        });
-        y += LINE_GAP;
-    }
     dl
-}
-
-/// Simple word-wrap by measured pixel width. Words longer than
-/// `max_w` get a line to themselves (they overflow gracefully
-/// rather than being chopped mid-character — readability
-/// matters more than absolute compliance for an error page).
-fn wrap_text_by_width(
-    font: &bui_text::Font,
-    text: &str,
-    font_size: f32,
-    max_w: f32,
-) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for word in text.split_whitespace() {
-        let candidate = if cur.is_empty() {
-            word.to_string()
-        } else {
-            format!("{cur} {word}")
-        };
-        if font.measure_text(&candidate, font_size) <= max_w || cur.is_empty() {
-            cur = candidate;
-        } else {
-            lines.push(std::mem::take(&mut cur));
-            cur = word.to_string();
-        }
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    lines
 }
 
 fn paint_status(width: f32, height: f32, url: &str, scroll_pct: u32, dl: &mut DisplayList) {
