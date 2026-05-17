@@ -252,6 +252,23 @@ impl JsContext {
         let _ = self.engine.vm().drain_microtasks();
     }
 
+    /// Publish per-NodeId layout frames so JS reads of
+    /// `getBoundingClientRect` / `offsetWidth` etc. return the
+    /// real geometry. The embedder calls this once per layout
+    /// pass with `(NodeId, (x, y, w, h))` tuples; previous
+    /// entries are replaced atomically. Missing entries return
+    /// zeros to JS — matching what real browsers report for
+    /// pre-paint or detached elements.
+    pub fn publish_layout_frames<I>(&self, frames: I)
+    where
+        I: IntoIterator<Item = (bui_dom::NodeId, (f32, f32, f32, f32))>,
+    {
+        let arc = self.bindings.layout_frames();
+        let mut map = arc.lock().unwrap();
+        map.clear();
+        map.extend(frames);
+    }
+
     /// Per-frame tick: fire every `setTimeout` / `setInterval` /
     /// `requestAnimationFrame` callback whose deadline elapsed
     /// at or before `now`, then drain queued microtasks. The
@@ -587,6 +604,103 @@ mod tests {
         // And we observe the side-effect of the handler running.
         let (fired, _) = ctx.engine.eval_with_output("fired");
         assert_eq!(fired, "1");
+    }
+
+    /// `getBoundingClientRect()` returns the geometry the
+    /// embedder published for the element after the most
+    /// recent layout pass. Was: zero-stub.
+    #[test]
+    fn bounding_client_rect_reads_published_frame() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let div = d.create_element("div");
+        d.element_mut(div).unwrap().set_attr("id", "d");
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, div);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+
+        // Before publish: rect is all zeros (matching the
+        // pre-paint browser default).
+        let (before, _) = ctx
+            .engine
+            .eval_with_output(
+                "(function(){\
+                     var r = document.querySelector('#d').getBoundingClientRect();\
+                     return r.x + ',' + r.y + ',' + r.width + ',' + r.height;\
+                 })()",
+            );
+        assert_eq!(before, "0,0,0,0");
+
+        // Publish a frame for the div, then re-read.
+        ctx.publish_layout_frames(vec![(div, (10.0, 20.0, 300.0, 50.0))]);
+        let (after, _) = ctx.engine.eval_with_output(
+            "(function(){\
+                 var r = document.querySelector('#d').getBoundingClientRect();\
+                 return r.x + ',' + r.y + ',' + r.width + ',' + r.height + \
+                        ',' + r.right + ',' + r.bottom;\
+             })()",
+        );
+        assert_eq!(after, "10,20,300,50,310,70");
+
+        let (ow, _) = ctx
+            .engine
+            .eval_with_output("document.querySelector('#d').offsetWidth");
+        assert_eq!(ow, "300");
+        let (oh, _) = ctx
+            .engine
+            .eval_with_output("document.querySelector('#d').offsetHeight");
+        assert_eq!(oh, "50");
+    }
+
+    /// `MutationObserver` / `IntersectionObserver` /
+    /// `ResizeObserver` constructors return a no-op-shaped
+    /// object. Feature-probe code (the typical
+    /// `if (window.MutationObserver) {…}` pattern) gets a
+    /// truthy answer and `.observe(…)` doesn't throw.
+    #[test]
+    fn observer_constructors_return_noop_shapes() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+
+        // Constructor probe succeeds.
+        let (typ, _) = ctx
+            .engine
+            .eval_with_output("typeof MutationObserver");
+        assert_eq!(typ, "function");
+
+        // Constructed object exposes the expected method set.
+        let (got, _) = ctx.engine.eval_with_output(
+            "(function(){\
+                 var mo = new MutationObserver(function(){});\
+                 mo.observe(document.body, { childList: true });\
+                 mo.disconnect();\
+                 return mo.takeRecords().length;\
+             })()",
+        );
+        assert_eq!(got, "0");
+
+        // IntersectionObserver and ResizeObserver behave the
+        // same way.
+        let (io_typ, _) = ctx
+            .engine
+            .eval_with_output("typeof IntersectionObserver");
+        assert_eq!(io_typ, "function");
+        let (ro_typ, _) = ctx
+            .engine
+            .eval_with_output("typeof ResizeObserver");
+        assert_eq!(ro_typ, "function");
     }
 
     /// Real `setTimeout` with a delay: a script schedules a

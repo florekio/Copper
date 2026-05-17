@@ -1763,7 +1763,13 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
     // into TabState.console_log so the dev-dock Console renders
     // them. Trips `last_width = 0` if a timer mutated the DOM so
     // the layout pass below re-builds against the new state.
-    {
+    //
+    // A timer callback may also have set `location.href` — drain
+    // the pending-nav queue here too so timer-driven redirects
+    // (common pattern: `setTimeout(() => location.href = url,
+    // 500)`) actually navigate instead of stalling until the
+    // next user input.
+    let pending_nav: Option<String> = {
         let tab = st.active_tab_mut();
         if let Some(ctx) = tab.js_ctx.as_mut() {
             ctx.tick(std::time::Instant::now());
@@ -1773,6 +1779,20 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
             }
             if ctx.take_dirty() {
                 tab.last_width = 0;
+            }
+            ctx.take_pending_navigation()
+        } else {
+            None
+        }
+    };
+    if let Some(target) = pending_nav {
+        let cur_url = st.active_tab().url.clone();
+        if let Ok(next_url) = cur_url.join(&target) {
+            if next_url.to_string() != cur_url.to_string() {
+                eprintln!("↳ JS-timer redirect → {next_url}");
+                if let Err(e) = st.active_tab_mut().navigate_to(&next_url) {
+                    eprintln!("timer redirect failed: {e}");
+                }
             }
         }
     }
@@ -1847,6 +1867,14 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
                 VIEWPORT_PADDING,
                 viewport_w,
             );
+            // Publish the per-NodeId frame map to bui-js so JS
+            // reads of `getBoundingClientRect` / `offsetWidth` /
+            // etc. return real geometry instead of zeros.
+            if let Some(ctx) = tab.js_ctx.as_mut() {
+                let mut frames: Vec<(bui_dom::NodeId, (f32, f32, f32, f32))> = Vec::new();
+                collect_layout_frames(&bx, &mut frames);
+                ctx.publish_layout_frames(frames);
+            }
             tab.layout = Some(bx);
             tab.last_width = viewport.width;
         }
@@ -2839,6 +2867,26 @@ fn empty_state(font: &bui_text::Font, msg: &str, x: f32, y: f32, dl: &mut Displa
 }
 
 // ---- IDE-Pane status line (bottom strip) ----
+
+/// Walk the layout tree and collect every `(NodeId, frame)`
+/// pair into `out`. bui-js's `__elemFrame` host fn reads from
+/// this list to back `getBoundingClientRect` and friends.
+/// Anonymous / kind-only boxes (`BoxKind::Anonymous`,
+/// `InlineText`, …) have `node: None` and are skipped.
+fn collect_layout_frames(
+    bx: &bui_layout::LayoutBox,
+    out: &mut Vec<(bui_dom::NodeId, (f32, f32, f32, f32))>,
+) {
+    if let Some(nid) = bx.node {
+        out.push((
+            nid,
+            (bx.frame.x, bx.frame.y, bx.frame.width, bx.frame.height),
+        ));
+    }
+    for child in &bx.children {
+        collect_layout_frames(child, out);
+    }
+}
 
 /// Build a display list that explains why the body is empty.
 /// Triggered when the page produced no Text commands at all

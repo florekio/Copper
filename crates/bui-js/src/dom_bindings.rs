@@ -208,6 +208,14 @@ pub(crate) struct ScheduledTimer {
     pub repeat: Option<std::time::Duration>,
 }
 
+/// Per-NodeId layout geometry the embedder publishes after each
+/// layout pass. Reads on `Element.getBoundingClientRect` /
+/// `offsetWidth` / etc. snapshot from here, so the values are
+/// live as of the most recent paint. Missing entries fall back
+/// to zeros — matches what a fresh page reports before its
+/// first paint.
+pub type LayoutFrames = std::collections::HashMap<NodeId, (f32, f32, f32, f32)>;
+
 pub struct BindingContext {
     shared: Arc<Mutex<DomShared>>,
     elem_tag: HostTag,
@@ -218,6 +226,13 @@ pub struct BindingContext {
     /// would deadlock if the callback itself schedules a new
     /// timer.
     timers: Arc<Mutex<Vec<ScheduledTimer>>>,
+    /// NodeId → (x, y, width, height) snapshot the embedder
+    /// publishes after each layout pass. Backs the geometry
+    /// surface (`getBoundingClientRect`, `offsetWidth/Height`,
+    /// etc.). Missing entries fall back to zeros — that's the
+    /// same answer real browsers give for a detached or
+    /// not-yet-painted element.
+    layout_frames: Arc<Mutex<LayoutFrames>>,
     /// URL JS asked us to navigate to via `location.href = ...` (or
     /// `location.assign(...)` / `location.replace(...)`). Drained
     /// once by the embedder after the script pass completes.
@@ -1315,6 +1330,53 @@ impl BindingContext {
             Ok(Value::null())
         });
 
+        // ---- Layout geometry ----
+        //
+        // `__elemFrame(handle)` returns the (x, y, w, h) the
+        // embedder published for this NodeId after the most
+        // recent layout pass, packed into a JS array. The
+        // prelude unpacks it into `getBoundingClientRect` /
+        // `offset*` / `client*` reads. Missing entries (newly-
+        // created nodes, pre-paint state) return [0, 0, 0, 0]
+        // — matching what real browsers return for elements
+        // outside the laid-out tree.
+        let layout_frames: Arc<Mutex<LayoutFrames>> =
+            Arc::new(Mutex::new(LayoutFrames::new()));
+        let frames_for_get = layout_frames.clone();
+        let shared_for_frame = shared.clone();
+        engine.register_host_fn("__elemFrame", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(vm.alloc_array(vec![
+                    Value::number(0.0),
+                    Value::number(0.0),
+                    Value::number(0.0),
+                    Value::number(0.0),
+                ]));
+            };
+            let nid = match shared_for_frame.lock().unwrap().node_for_handle(handle) {
+                Some(n) => n,
+                None => {
+                    return Ok(vm.alloc_array(vec![
+                        Value::number(0.0),
+                        Value::number(0.0),
+                        Value::number(0.0),
+                        Value::number(0.0),
+                    ]));
+                }
+            };
+            let (x, y, w, h) = frames_for_get
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&nid).copied())
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            Ok(vm.alloc_array(vec![
+                Value::number(x as f64),
+                Value::number(y as f64),
+                Value::number(w as f64),
+                Value::number(h as f64),
+            ]))
+        });
+
         // ---- Timer scheduler ----
         //
         // `__setTimeoutHost(fn, ms)` and `__setIntervalHost(fn,
@@ -1424,6 +1486,7 @@ impl BindingContext {
             prevent_default_fn,
             stop_propagation_fn,
             timers,
+            layout_frames,
         }
     }
 
@@ -1477,6 +1540,14 @@ impl BindingContext {
     /// `JsContext::tick(now)`.
     pub(crate) fn timers(&self) -> Arc<Mutex<Vec<ScheduledTimer>>> {
         self.timers.clone()
+    }
+
+    /// Shared NodeId → (x, y, width, height) map backing the
+    /// geometry surface (`getBoundingClientRect` etc.). The
+    /// embedder calls `JsContext::publish_layout_frames` after
+    /// each layout pass; reads from JS go through `__elemFrame`.
+    pub fn layout_frames(&self) -> Arc<Mutex<LayoutFrames>> {
+        self.layout_frames.clone()
     }
 
     /// Build a fresh `EventDispatchCtx` for one dispatch — the
@@ -1747,34 +1818,43 @@ function _wrapElem(handle) {
             if (!other || other._h === undefined) return false;
             return __elemContains(this._h, other._h);
         },
-        // ---- Layout-geometry stubs ----
+        // ---- Layout geometry ----
         //
-        // Every modern UI library reads at least one of these
-        // (offsetWidth, getBoundingClientRect, etc.) and
-        // crashes if they're undefined. We return zeros until
-        // the layout-lookup integration in a follow-up wires
-        // them to the real per-frame layout tree. Functions
-        // are no-ops so scripts that *call* them (not read
-        // values) survive too.
-        get offsetWidth()  { return 0; },
-        get offsetHeight() { return 0; },
-        get offsetTop()    { return 0; },
-        get offsetLeft()   { return 0; },
-        get clientWidth()  { return 0; },
-        get clientHeight() { return 0; },
+        // Reads from the embedder-published frame map. `__elemFrame`
+        // returns [x, y, width, height]; missing entries (newly-
+        // created nodes, anything before the first paint) get
+        // [0, 0, 0, 0]. Real browsers behave the same way for
+        // detached elements, so this is honest semantics rather
+        // than a stub.
+        get offsetWidth()  { return __elemFrame(this._h)[2]; },
+        get offsetHeight() { return __elemFrame(this._h)[3]; },
+        get offsetTop()    { return __elemFrame(this._h)[1]; },
+        get offsetLeft()   { return __elemFrame(this._h)[0]; },
+        get clientWidth()  { return __elemFrame(this._h)[2]; },
+        get clientHeight() { return __elemFrame(this._h)[3]; },
         get clientTop()    { return 0; },
         get clientLeft()   { return 0; },
-        get scrollWidth()  { return 0; },
-        get scrollHeight() { return 0; },
+        get scrollWidth()  { return __elemFrame(this._h)[2]; },
+        get scrollHeight() { return __elemFrame(this._h)[3]; },
         get scrollTop()    { return 0; },
         get scrollLeft()   { return 0; },
         getBoundingClientRect: function() {
+            var r = __elemFrame(this._h);
+            var x = r[0], y = r[1], w = r[2], h = r[3];
             return {
-                x: 0, y: 0, width: 0, height: 0,
-                top: 0, right: 0, bottom: 0, left: 0
+                x: x, y: y, width: w, height: h,
+                top: y, right: x + w, bottom: y + h, left: x
             };
         },
-        getClientRects: function() { return []; },
+        getClientRects: function() {
+            var r = __elemFrame(this._h);
+            if (r[2] === 0 && r[3] === 0) return [];
+            return [{
+                x: r[0], y: r[1], width: r[2], height: r[3],
+                top: r[1], right: r[0] + r[2],
+                bottom: r[1] + r[3], left: r[0]
+            }];
+        },
         focus: __noop,
         blur: __noop,
         click: __noop,
@@ -2031,6 +2111,42 @@ var _ = {};
 // real values. Each slot is a no-op or empty container that
 // silently accepts the typical `google.timers.load.t.X = Y`
 // assignments instead of throwing on undefined access.
+// MutationObserver / IntersectionObserver / ResizeObserver
+// stubs. Real implementations would (a) track the (target,
+// options) registrations and (b) emit records on every DOM
+// mutation / layout pass. We don't wire either today; the
+// constructor returns an object with the expected methods so
+// pages that probe `typeof MutationObserver === 'function'`
+// and then call `.observe(target, …)` survive. Callbacks
+// never fire — pages that *depend* on a record being emitted
+// (live-update widgets, lazy images) won't work, but they
+// also won't crash; failing as "static" is preferable to
+// failing as "throw".
+function MutationObserver(_cb) {
+    return {
+        observe: __noop,
+        disconnect: __noop,
+        takeRecords: function() { return []; }
+    };
+}
+function IntersectionObserver(_cb, _opts) {
+    return {
+        observe: __noop,
+        unobserve: __noop,
+        disconnect: __noop,
+        takeRecords: function() { return []; },
+        root: null,
+        rootMargin: '0px',
+        thresholds: [0]
+    };
+}
+function ResizeObserver(_cb) {
+    return {
+        observe: __noop,
+        unobserve: __noop,
+        disconnect: __noop
+    };
+}
 var google = {
     kEI: '', kEXPI: '', kPS: '', kHL: 'en',
     sn: '', c: {},
@@ -2059,6 +2175,9 @@ window.gapi = gapi;
 window.location = location;
 window.history = history;
 window.navigator = navigator;
+window.MutationObserver = MutationObserver;
+window.IntersectionObserver = IntersectionObserver;
+window.ResizeObserver = ResizeObserver;
 var self = window;
 "#;
 
