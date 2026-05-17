@@ -174,7 +174,7 @@ impl JsContext {
         );
 
         let mut outcomes = Vec::with_capacity(scripts.len());
-        for (node, source) in scripts {
+        for (script_idx, (node, source)) in scripts.into_iter().enumerate() {
             // First-cut Phase 19 (docs/google-render-plan.md):
             // detect Closure-compiler IIFEs and inject a
             // namespace stub so the `_.X` cascade no longer
@@ -186,7 +186,22 @@ impl JsContext {
             let rewritten = closure_shim::maybe_inject(&source);
             let (result, mut output) = engine.eval_with_output(&rewritten);
             if is_script_error(&result) {
-                output.push(format!("Uncaught {result}"));
+                // Capture a source preview so the dev-dock
+                // Console + the [js] tracer can identify
+                // which inline script failed — naming by
+                // index alone is meaningless when a page
+                // has 15 scripts. 80 chars is enough to
+                // pick out the canonical first-line shape
+                // ("(function(){this.gbar_=…", "var _g=…",
+                // …) without flooding the log.
+                let preview: String = source
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(80)
+                    .collect();
+                output.push(format!(
+                    "Uncaught {result}  [script #{script_idx}: {preview}…]"
+                ));
             }
             outcomes.push(ScriptOutcome {
                 node,

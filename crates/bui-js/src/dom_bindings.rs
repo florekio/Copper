@@ -2339,10 +2339,13 @@ var document = {
     hidden: false,
     visibilityState: 'visible',
     readyState: 'complete',
+    prerendering: false,
     title: '',
     URL: '',
     referrer: '',
     cookie: '',
+    domain: '',
+    characterSet: 'UTF-8',
     // FontFaceSet stub. `document.fonts.load(font, text)` is
     // used by Google's preload path and lots of icon-font
     // libraries. Returns a resolved Promise — the page proceeds
@@ -2464,7 +2467,22 @@ var location = {
     replace: __navigate,
     reload: __noop
 };
-var navigator = { userAgent: 'bui/0.1', language: 'en-US' };
+var navigator = {
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Copper/0.1.0 Safari/537.36',
+    language: 'en-US',
+    languages: ['en-US'],
+    platform: 'MacIntel',
+    onLine: true,
+    cookieEnabled: true,
+    doNotTrack: null,
+    hardwareConcurrency: 4,
+    maxTouchPoints: 0,
+    vendor: 'Google Inc.',
+    sendBeacon: __sendBeacon,
+    geolocation: { getCurrentPosition: __noop, watchPosition: __noop, clearWatch: __noop },
+    clipboard: { writeText: function(){ return Promise.resolve(); }, readText: function(){ return Promise.resolve(''); } },
+    serviceWorker: { register: function(){ return Promise.reject(new Error('not supported')); }, controller: null }
+};
 var history = { length: 1, state: null, pushState: __noop, replaceState: __noop, back: __noop, forward: __noop, go: __noop };
 var window = {
     document: document,
@@ -2532,12 +2550,27 @@ var performance = {
     clearMarks: __noop,
     clearMeasures: __noop
 };
-// Defensive `_` stub. Google's inline-script bundle uses `_` as
-// a chunk-loader namespace before its real definition assigns
-// to it; a probing access like `_.foo` would crash with
-// `ReferenceError: _ is not defined` otherwise. Real
-// `var _ = …` later in the same scope shadows this fine.
+// Defensive `_`, `_s`, `_qs` stubs. Google's inline bundle
+// uses these as Closure chunk-loader namespaces and assigns to
+// them via `window._s = window._s || {};` then immediately
+// reads bare `_s`. In real browsers, `window.X = …` at top
+// level aliases as a bare global; in Zinc, `window` is a
+// local object literal in the prelude so the alias is
+// explicit. Pre-creating these AND wiring `window._ = _` (see
+// below) keeps both spelling paths pointing at the same
+// underlying object.
 var _ = {};
+var _s = {};
+var _qs = {};
+// Google's bootstrap installs `_DumpException` on `_`, `_s`,
+// `_qs` to re-throw caught errors. Pre-stubbing as a thrower
+// matches the spec exactly and prevents the `_._DumpException
+// is not a function` cascade when subsequent code reaches for
+// it.
+function __dumpException(e) { throw e; }
+_._DumpException = __dumpException;
+_s._DumpException = __dumpException;
+_qs._DumpException = __dumpException;
 // Google's `google.*` namespace pre-populated with the timer +
 // chunk-loader shape its inline scripts touch before defining
 // real values. Each slot is a no-op or empty container that
@@ -2582,15 +2615,98 @@ function ResizeObserver(_cb) {
         disconnect: __noop
     };
 }
+// `Image` is the classic preload constructor — `new Image();
+// img.src = '/preload.png'` queues an HTTP fetch. A no-op
+// implementation that swallows the src assignment lets pages
+// using it as a preload hint survive; real preload routing
+// can come later via our fetcher infrastructure.
+function Image(_w, _h) {
+    return {
+        src: '',
+        srcset: '',
+        crossOrigin: null,
+        complete: true,
+        naturalWidth: 0,
+        naturalHeight: 0,
+        onload: null,
+        onerror: null,
+        addEventListener: __noop,
+        removeEventListener: __noop
+    };
+}
+// `Audio` follows the same shape (very commonly used as a
+// silent ping target). Stub for the same reason.
+function Audio(_src) {
+    return {
+        src: '',
+        play: function() { return Promise.resolve(); },
+        pause: __noop,
+        load: __noop,
+        addEventListener: __noop,
+        removeEventListener: __noop
+    };
+}
+// XMLHttpRequest stub. Google's bootstrap branches on
+// `typeof XMLHttpRequest !== 'undefined'` — and then issues
+// /gen_204 telemetry pings. Returning a fake instance whose
+// methods are all no-ops keeps the page progressing past the
+// "feature detect → use it" path without ever hitting the
+// network. A real implementation would route through our
+// fetcher infrastructure same as `fetch()`; Phase 10 work.
+function XMLHttpRequest() {
+    return {
+        readyState: 0,
+        status: 0,
+        statusText: '',
+        responseText: '',
+        responseType: '',
+        response: null,
+        responseURL: '',
+        onreadystatechange: null,
+        onload: null,
+        onerror: null,
+        onabort: null,
+        ontimeout: null,
+        onloadend: null,
+        onprogress: null,
+        upload: {
+            addEventListener: __noop,
+            removeEventListener: __noop
+        },
+        open: __noop,
+        send: __noop,
+        setRequestHeader: __noop,
+        abort: __noop,
+        getResponseHeader: function() { return null; },
+        getAllResponseHeaders: function() { return ''; },
+        addEventListener: __noop,
+        removeEventListener: __noop,
+        withCredentials: false,
+        timeout: 0
+    };
+}
+// `navigator.sendBeacon(url, body)` is a fire-and-forget
+// ping API. Real impl would route through bui-net; stub
+// returns true so callers think the beacon went out.
+function __sendBeacon(_url, _body) { return true; }
 var google = {
     kEI: '', kEXPI: '', kPS: '', kHL: 'en',
-    sn: '', c: {},
+    sn: '', c: { b: function(){} },
     jsr: __noop,
     tick: __noop,
     log: __noop,
     x: __noop,
-    erd: { jsr: 0, bv: 0, de: false, c: '' },
-    timers: { load: { t: {} } },
+    erd: { jsr: 0, bv: 0, de: false, c: '', dpf: '' },
+    // `google.timers.load.m` is consulted by `google.c.b`:
+    //   google.c.b = function(a){var b=google.timers.load.m;
+    //       b[a]&&google.ml(Error("b"))}
+    // Without `.m`, the function throws on undefined indexing.
+    timers: { load: { t: {}, m: {} } },
+    // `google.ml(error, …)` is the page's central error logger.
+    // Stubbing as no-op silences a class of error-cascade
+    // throws where one script's failure triggers ml() on the
+    // next.
+    ml: __noop,
     // `stvsc: true` is the load-bearing flag. Google's first
     // inline script does
     //   ((a=window.google)==null ? 0 : a.stvsc) ?
@@ -2627,6 +2743,64 @@ window.navigator = navigator;
 window.MutationObserver = MutationObserver;
 window.IntersectionObserver = IntersectionObserver;
 window.ResizeObserver = ResizeObserver;
+window.Image = Image;
+window.Audio = Audio;
+window.XMLHttpRequest = XMLHttpRequest;
+// Google's bootstrap iterates a list of candidates
+// [globalThis, self, window, this, …] checking `e.Math === Math`
+// to find the real global object — fails over to `throw
+// Error("b")` if none match. Mirror the JS primitives onto
+// our local `window` so that check passes.
+window.Math = Math;
+window.JSON = JSON;
+window.Object = Object;
+window.Array = Array;
+window.Date = Date;
+window.RegExp = RegExp;
+window.Error = Error;
+window.TypeError = TypeError;
+window.RangeError = RangeError;
+window.SyntaxError = SyntaxError;
+window.ReferenceError = ReferenceError;
+window.Promise = Promise;
+window.Symbol = (typeof Symbol === 'undefined') ? undefined : Symbol;
+window.Map = Map;
+window.Set = Set;
+window.WeakMap = WeakMap;
+window.WeakSet = WeakSet;
+window.parseInt = parseInt;
+window.parseFloat = parseFloat;
+window.isNaN = isNaN;
+window.isFinite = isFinite;
+window.encodeURIComponent = encodeURIComponent;
+window.decodeURIComponent = decodeURIComponent;
+window.encodeURI = encodeURI;
+window.decodeURI = decodeURI;
+window.console = console;
+window.globalThis = window;
+window.self = window;
+window.top = window;
+window.parent = window;
+window.frames = window;
+// `_` / `_s` / `_qs` aliased onto window so the
+// `window.X = window.X || {}` idiom that Google's bootstrap
+// runs returns the same object bare-`X` reads point at.
+window._ = _;
+window._s = _s;
+window._qs = _qs;
+window._DumpException = __dumpException;
+// `_F_toggles` / `_F_jsUrl` / `_F_installCss` are
+// experiment-flag globals Google's bundle assigns to before
+// the JS bundle loads. Pre-stubbing as truthy-empty values
+// stops `length` reads on undefined cascades when other code
+// reaches for them prematurely.
+window._F_toggles = [];
+window._F_jsUrl = '';
+window._F_installCss = __noop;
+window._rtf = __noop;
+window._xjs_toggles = [];
+window.loaded_h_0 = __noop;
+window.n = null;
 var self = window;
 "#;
 
