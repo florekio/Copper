@@ -89,9 +89,45 @@ Zinc's new source-location annotations on TypeError messages
 (commit `688bd4e` in the Zinc repo). Line 0 means the error
 is in a dynamically-eval'd chunk where source-line mapping
 isn't populated; pc 13 means very near the start of that
-chunk's bytecode. So the failing call site is in the first
-~13 bytes of the eval'd bundle's bytecode — narrows the
-search dramatically. Wrapped
+chunk's bytecode.
+
+Manual instrumentation: inserted `console.log('M1')`,
+`console.log('M2 VL')` markers into the eval'd source.
+Output:
+```
+M1
+M2 VL
+```
+M1 = inside the IIFE start. M2 = after `var VL=function`
+definition started. M3 (after `var x=this||self`) never
+fires. So the failure is somewhere in the long
+`var VL = function(){…}, fu = function(){…}, …` chain —
+151 function declarations bound at module init.
+
+The bundle wraps everything in one IIFE that runs all 151
+function definitions PLUS a long init sequence (`((CN=VL(…
+` etc.). The init sequence calls `VL(…)` immediately. VL's
+body references `Oc[L]` — but `Oc` is defined later in the
+same chain. So either:
+1. The chain's expression-order evaluation hits VL's call
+   before Oc is initialised — and Oc resolves to
+   `undefined` — and `Oc[L]` is `undefined[L]` →
+   ReferenceError-style throw.
+2. Or some assignment in the chain produces an unexpected
+   value.
+
+The next investigation needs a different toolset than
+manual command-line bisection of a 60+ KB minified
+bundle — either:
+- Add per-instruction tracing in Zinc (dump every OpCall
+  with its receiver) and run; the trace pinpoints the call.
+- Or step the bundle with a JS debugger and capture the
+  state at the moment of error.
+
+Both are session-sized in the right environment but
+unwieldy from cold-start CLI grep + bisect.
+
+Wrapped
 the eval'd bundle's body in try/catch and caught the
 message: `constructor,hasOwnProperty,isPrototypeOf,
 propertyIsEnumerable,toLocaleString,toString,valueOf is
