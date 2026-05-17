@@ -91,6 +91,38 @@ is in a dynamically-eval'd chunk where source-line mapping
 isn't populated; pc 13 means very near the start of that
 chunk's bytecode.
 
+**Per-instruction OpCall tracing shipped (Zinc commit
+`9b9d19e`).** Setting `ZINC_TRACE_CALLS=1` dumps every
+OpCall / OpCallMethod with receiver shape + bytecode
+position. Run against /search:
+
+```
+…lots of trace lines…
+CallMethod line=25519 pc=16 recv-kind=obj method=sendBeacon argc=2
+Call line=1 pc=5 kind=fn argc=0
+CallMethod line=66 pc=24 recv-kind=fn method=call argc=1
+Call line=77 pc=11 kind=fn argc=2
+Call line=38164 pc=14 kind=obj recv=[object Object] argc=2   ← last successful
+[js] Uncaught …TypeError… (at line 0, pc 13)
+```
+
+The last successful call is on an `[object Object]` with
+`__constructor__` marker (Zinc's "constructible" path) at
+source line 38164. The construct call returns SOMETHING.
+The next instruction reads `.call` off the returned value,
+which is undefined.
+
+Diagnosed cause: Zinc's "call object via __constructor__"
+path returns undefined instead of the constructed instance
+in this code shape. The bundle expects `new X(a, b)` to
+return the new instance; it gets undefined; then
+`undefined.call` throws.
+
+Next investigation needs to look at Zinc's
+`__constructor__` invocation path in vm.rs and verify it
+returns the new instance, not undefined. That's a
+focused engine fix.
+
 Manual instrumentation: inserted `console.log('M1')`,
 `console.log('M2 VL')` markers into the eval'd source.
 Output:
