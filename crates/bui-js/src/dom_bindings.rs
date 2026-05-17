@@ -2739,6 +2739,16 @@ var document = {
     get body() {
         return _wrapElem(__docBody());
     },
+    // documentElement: the root <html> element. Resolved via
+    // querySelector("html") so the wrapped Element gets the
+    // full surface (dataset, classList, style, addEventListener,
+    // …). Previously a stub object with just two methods, which
+    // broke any page reading `documentElement.dataset.theme` /
+    // `documentElement.classList.add(...)` / etc. MDN hits this
+    // on first load to apply the saved color-scheme.
+    get documentElement() {
+        return _wrapElem(__qs("html"));
+    },
     querySelector: function(s) {
         return _wrapElem(__qs(s));
     },
@@ -3498,10 +3508,9 @@ function fetch(url, _opts) {
 }
 document.addEventListener = __ael;
 document.removeEventListener = __noop;
-document.documentElement = {
-    addEventListener: __ael,
-    removeEventListener: __noop
-};
+// (document.documentElement is now a getter on the document
+// literal above — returns a wrapped Element for the <html>
+// node so dataset / classList / addEventListener all work.)
 var location = {
     get href() { return __current_url(); },
     set href(v) { __navigate(v); },
@@ -3592,6 +3601,33 @@ var performance = {
     clearMarks: __noop,
     clearMeasures: __noop
 };
+// `localStorage` / `sessionStorage` — in-memory only (no
+// persistence across sessions). Real browsers persist to disk;
+// for our render-and-go embedder, in-memory is enough because
+// most code paths just probe these to cache derived state and
+// fall back gracefully when nothing's stored. Most pages
+// reference `localStorage` directly during script init (for
+// theme preferences, dismissed-banner flags, etc.); leaving it
+// undefined was triggering ReferenceError on MDN and others.
+function __makeStorage() {
+    var data = {};
+    return {
+        getItem: function(k) {
+            k = String(k);
+            return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null;
+        },
+        setItem: function(k, v) { data[String(k)] = String(v); },
+        removeItem: function(k) { delete data[String(k)]; },
+        clear: function() { for (var k in data) delete data[k]; },
+        key: function(i) {
+            var keys = Object.keys(data);
+            return i >= 0 && i < keys.length ? keys[i] : null;
+        },
+        get length() { return Object.keys(data).length; }
+    };
+}
+var localStorage = __makeStorage();
+var sessionStorage = __makeStorage();
 // Defensive `_`, `_s`, `_qs` stubs. Google's inline bundle
 // uses these as Closure chunk-loader namespaces and assigns to
 // them via `window._s = window._s || {};` then immediately
@@ -3778,6 +3814,8 @@ var gapi = { load: __noop };
 // they break the moment the lookup returns `undefined`.
 window.google = google;
 window.performance = performance;
+window.localStorage = localStorage;
+window.sessionStorage = sessionStorage;
 window.gapi = gapi;
 window.location = location;
 window.history = history;
