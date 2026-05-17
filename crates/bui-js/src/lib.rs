@@ -50,13 +50,20 @@ pub struct ScriptOutcome {
 /// pages, prefer `execute_inline_scripts_with_dom`.
 pub fn execute_inline_scripts(doc: &Document) -> Vec<ScriptOutcome> {
     let mut engine = Engine::new();
-    let scripts = collect_inline_scripts(doc);
+    let scripts = collect_scripts(doc);
     let mut out = Vec::with_capacity(scripts.len());
     for (node, source) in scripts {
-        let (result, output) = engine.eval_with_output(&source);
+        let body = match source {
+            ScriptSource::Inline(s) => s,
+            // No fetcher here — external scripts are skipped
+            // for the test-only entry point. The real path goes
+            // through `JsContext::install_and_run`.
+            ScriptSource::External(_) => continue,
+        };
+        let (result, output) = engine.eval_with_output(&body);
         out.push(ScriptOutcome {
             node,
-            source,
+            source: body,
             result,
             output,
         });
@@ -147,7 +154,7 @@ impl JsContext {
     ) -> (Self, Vec<ScriptOutcome>) {
         let scripts = {
             let d = doc.lock().unwrap();
-            collect_inline_scripts(&d)
+            collect_scripts(&d)
         };
 
         let mut engine = Engine::new();
@@ -170,11 +177,69 @@ impl JsContext {
             &mut engine,
             doc.clone(),
             current_url,
-            fetcher,
+            fetcher.clone(),
         );
 
         let mut outcomes = Vec::with_capacity(scripts.len());
         for (script_idx, (node, source)) in scripts.into_iter().enumerate() {
+            // Resolve external scripts via the embedder's
+            // fetcher — without this, every modern site that
+            // loads its main bundle via `<script src=…>` ran
+            // its inline `<script>`s alone and missed the
+            // actual rendering code (Google's xjs, React's
+            // app.js, every CDN'd bundle).
+            //
+            // Size cap: 256 KB. Google's xjs bundle is 1MB+ of
+            // Closure-compiled output; running it through Zinc
+            // burns through `set_max_steps` (50M) without ever
+            // resolving and effectively hangs the browser
+            // thread. Until the engine can handle bundles of
+            // that size — or until we ship a real closure-
+            // library shim that lets the bundle short-circuit
+            // its bootstrap — capping at 256 KB lets the
+            // typical CDN-hosted React/Vue app run while
+            // skipping the giant minified payloads. The
+            // outcome record carries the skip so the dev-dock
+            // Console shows what happened.
+            const EXTERNAL_SCRIPT_CAP: usize = 256 * 1024;
+            let source: String = match source {
+                ScriptSource::Inline(s) => s,
+                ScriptSource::External(url) => {
+                    let Some(ref f) = fetcher else { continue };
+                    let Some(resp) = f(&url) else { continue };
+                    if !(200..300).contains(&resp.status) {
+                        outcomes.push(ScriptOutcome {
+                            node,
+                            source: format!("<external {url}>"),
+                            result: format!("HTTP {}: skipping", resp.status),
+                            output: vec![format!(
+                                "[js] external {} returned HTTP {}",
+                                url, resp.status
+                            )],
+                        });
+                        continue;
+                    }
+                    if resp.body.len() > EXTERNAL_SCRIPT_CAP {
+                        outcomes.push(ScriptOutcome {
+                            node,
+                            source: format!("<external {url}>"),
+                            result: format!(
+                                "skipped: {} bytes > {} cap",
+                                resp.body.len(),
+                                EXTERNAL_SCRIPT_CAP
+                            ),
+                            output: vec![format!(
+                                "[js] external {} skipped ({} bytes > {} cap)",
+                                url,
+                                resp.body.len(),
+                                EXTERNAL_SCRIPT_CAP
+                            )],
+                        });
+                        continue;
+                    }
+                    String::from_utf8_lossy(&resp.body).into_owned()
+                }
+            };
             // First-cut Phase 19 (docs/google-render-plan.md):
             // detect Closure-compiler IIFEs and inject a
             // namespace stub so the `_.X` cascade no longer
@@ -527,10 +592,18 @@ fn is_script_error(result: &str) -> bool {
         || result.starts_with("RuntimeError:")
 }
 
-/// Walk the document for inline `<script>` elements (no `src`) and
-/// concatenate their text-node children into a list of
-/// `(NodeId, source)` pairs in document order.
-fn collect_inline_scripts(doc: &Document) -> Vec<(NodeId, String)> {
+/// One `<script>` element resolved for evaluation: either an
+/// inline body or an external URL that needs fetching.
+pub(crate) enum ScriptSource {
+    Inline(String),
+    External(String),
+}
+
+/// Walk the document for `<script>` elements in document order.
+/// Inline scripts capture their text-node body; external
+/// scripts carry the URL the embedder still needs to fetch
+/// (deferred so the caller can use the live `Fetcher`).
+fn collect_scripts(doc: &Document) -> Vec<(NodeId, ScriptSource)> {
     let mut out = Vec::new();
     for nid in doc.descendants(doc.root) {
         let Some(elem) = doc.element(nid) else {
@@ -539,7 +612,27 @@ fn collect_inline_scripts(doc: &Document) -> Vec<(NodeId, String)> {
         if elem.name != "script" {
             continue;
         }
-        if elem.get_attr("src").is_some() {
+        // `type="application/json"` etc. are data scripts — not
+        // executable. Real browsers run only `text/javascript`
+        // (default), `module`, or `text/ecmascript`. We don't
+        // do modules yet so skip them too.
+        let ty = elem
+            .get_attr("type")
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !ty.is_empty()
+            && ty != "text/javascript"
+            && ty != "application/javascript"
+            && ty != "application/ecmascript"
+            && ty != "text/ecmascript"
+        {
+            continue;
+        }
+        if let Some(src) = elem.get_attr("src") {
+            let src = src.trim();
+            if !src.is_empty() {
+                out.push((nid, ScriptSource::External(src.to_string())));
+            }
             continue;
         }
         let mut source = String::new();
@@ -551,7 +644,7 @@ fn collect_inline_scripts(doc: &Document) -> Vec<(NodeId, String)> {
             child = doc.node(c).next_sibling;
         }
         if !source.trim().is_empty() {
-            out.push((nid, source));
+            out.push((nid, ScriptSource::Inline(source)));
         }
     }
     out
@@ -754,6 +847,72 @@ mod tests {
         // And we observe the side-effect of the handler running.
         let (fired, _) = ctx.engine.eval_with_output("fired");
         assert_eq!(fired, "1");
+    }
+
+    /// External `<script src=…>` is fetched via the embedder's
+    /// Fetcher and evaluated. Was: silently skipped, which
+    /// meant every framework-driven page (Google, React apps,
+    /// Vue apps) ran inline scripts in isolation and never
+    /// loaded its actual bundle.
+    #[test]
+    fn external_script_is_fetched_and_executed() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let script = d.create_element("script");
+        d.element_mut(script)
+            .unwrap()
+            .set_attr("src", "/app.js");
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(html, script);
+
+        let doc = Arc::new(Mutex::new(d));
+        let fetcher: crate::Fetcher = std::sync::Arc::new(|url: &str| {
+            assert_eq!(url, "/app.js");
+            Some(crate::FetchResponse {
+                status: 200,
+                url: url.to_string(),
+                body: b"globalThis.fromExternal = 42;".to_vec(),
+            })
+        });
+        let (mut ctx, _outcomes) = JsContext::install_and_run(
+            doc.clone(),
+            "https://example.com/".into(),
+            Some(fetcher),
+        );
+        let (got, _) = ctx.engine.eval_with_output("fromExternal");
+        assert_eq!(got, "42");
+    }
+
+    /// External script with a non-200 response is recorded
+    /// as a skipped outcome so the dev-dock Console shows the
+    /// failure, but no JS evaluation runs. 404 / 500 / network
+    /// failure all land here.
+    #[test]
+    fn external_script_with_404_records_skipped_outcome() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let script = d.create_element("script");
+        d.element_mut(script).unwrap().set_attr("src", "/missing.js");
+        d.append_child(d.root, html);
+        d.append_child(html, script);
+
+        let doc = Arc::new(Mutex::new(d));
+        let fetcher: crate::Fetcher = std::sync::Arc::new(|url: &str| {
+            Some(crate::FetchResponse {
+                status: 404,
+                url: url.to_string(),
+                body: b"not found".to_vec(),
+            })
+        });
+        let (_ctx, outcomes) = JsContext::install_and_run(
+            doc.clone(),
+            "https://example.com/".into(),
+            Some(fetcher),
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.contains("HTTP 404"));
     }
 
     /// MutationObserver fires real records — setAttribute on an
