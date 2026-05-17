@@ -2588,6 +2588,107 @@ var document = {
     }
 };
 function __noop() {}
+// `encodeURIComponent` / `decodeURIComponent` polyfills.
+// Zinc doesn't ship them as builtins, and feature-probe code
+// that calls them bare crashes with "is not defined". UTF-8
+// encoding for non-ASCII follows the RFC 3986 rules.
+function encodeURIComponent(s) {
+    if (s === null || s === undefined) return String(s);
+    s = String(s);
+    var out = '';
+    for (var i = 0; i < s.length; i++) {
+        var c = s.charCodeAt(i);
+        var ch = s.charAt(i);
+        var unreserved =
+            (c >= 0x30 && c <= 0x39) ||   // 0-9
+            (c >= 0x41 && c <= 0x5A) ||   // A-Z
+            (c >= 0x61 && c <= 0x7A) ||   // a-z
+            ch === '-' || ch === '_' || ch === '.' || ch === '~' ||
+            ch === '!' || ch === '*' || ch === "'" || ch === '(' || ch === ')';
+        if (unreserved) {
+            out += ch;
+        } else if (c < 0x80) {
+            var hex = c.toString(16).toUpperCase();
+            out += '%' + (hex.length < 2 ? '0' : '') + hex;
+        } else if (c < 0x800) {
+            var b1 = (0xC0 | (c >> 6)).toString(16).toUpperCase();
+            var b2 = (0x80 | (c & 0x3F)).toString(16).toUpperCase();
+            out += '%' + b1 + '%' + b2;
+        } else {
+            var b1 = (0xE0 | (c >> 12)).toString(16).toUpperCase();
+            var b2 = (0x80 | ((c >> 6) & 0x3F)).toString(16).toUpperCase();
+            var b3 = (0x80 | (c & 0x3F)).toString(16).toUpperCase();
+            out += '%' + b1 + '%' + b2 + '%' + b3;
+        }
+    }
+    return out;
+}
+function decodeURIComponent(s) {
+    if (s === null || s === undefined) return String(s);
+    s = String(s);
+    var out = '';
+    for (var i = 0; i < s.length; i++) {
+        if (s.charAt(i) === '%' && i + 2 < s.length) {
+            var byte = parseInt(s.substr(i + 1, 2), 16);
+            if (!isNaN(byte)) {
+                out += String.fromCharCode(byte);
+                i += 2;
+                continue;
+            }
+        }
+        out += s.charAt(i);
+    }
+    return out;
+}
+// `encodeURI` / `decodeURI` are looser variants — encodeURI
+// leaves reserved characters (/:?#&=+,;@) alone. The
+// distinction matters when callers pass full URLs. For
+// pragmatic completeness without reimplementing both, point
+// these at the same component variants — over-encodes some
+// reserved chars but the result still parses correctly on
+// the server side.
+function encodeURI(s) { return encodeURIComponent(s); }
+function decodeURI(s) { return decodeURIComponent(s); }
+// `btoa` / `atob` — base64 round-trip for binary-safe
+// strings. Used by every modern bundle for inline assets,
+// preflight signing, source-map data URIs.
+function btoa(s) {
+    if (s === null || s === undefined) return '';
+    s = String(s);
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var out = '';
+    var i = 0;
+    while (i < s.length) {
+        var c1 = s.charCodeAt(i++);
+        var c2 = i < s.length ? s.charCodeAt(i++) : NaN;
+        var c3 = i < s.length ? s.charCodeAt(i++) : NaN;
+        out += chars.charAt(c1 >> 2);
+        out += chars.charAt(((c1 & 3) << 4) | (isNaN(c2) ? 0 : (c2 >> 4)));
+        out += isNaN(c2) ? '=' : chars.charAt(((c2 & 15) << 2) | (isNaN(c3) ? 0 : (c3 >> 6)));
+        out += isNaN(c3) ? '=' : chars.charAt(c3 & 63);
+    }
+    return out;
+}
+function atob(s) {
+    if (s === null || s === undefined) return '';
+    s = String(s).replace(/[^A-Za-z0-9+/]/g, '');
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var out = '';
+    var i = 0;
+    while (i < s.length) {
+        var e1 = chars.indexOf(s.charAt(i++));
+        var e2 = chars.indexOf(s.charAt(i++));
+        var e3 = chars.indexOf(s.charAt(i++));
+        var e4 = chars.indexOf(s.charAt(i++));
+        var c1 = (e1 << 2) | (e2 >> 4);
+        var c2 = ((e2 & 15) << 4) | (e3 >> 2);
+        var c3 = ((e3 & 3) << 6) | e4;
+        out += String.fromCharCode(c1);
+        if (e3 !== -1 && e3 < 64) out += String.fromCharCode(c2);
+        if (e4 !== -1 && e4 < 64) out += String.fromCharCode(c3);
+    }
+    return out;
+}
 // Timer scheduling now routes through host fns that push onto
 // a shared queue; the embedder's frame tick drains entries
 // whose deadline has elapsed. `setTimeout(fn, 0)` therefore
@@ -3003,6 +3104,8 @@ window.encodeURIComponent = encodeURIComponent;
 window.decodeURIComponent = decodeURIComponent;
 window.encodeURI = encodeURI;
 window.decodeURI = decodeURI;
+window.btoa = btoa;
+window.atob = atob;
 window.console = console;
 window.globalThis = window;
 window.self = window;
