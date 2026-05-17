@@ -1409,34 +1409,72 @@ impl BindingContext {
             Ok(handle)
         });
 
+        // classList mutations fire `attributes` MutationRecord
+        // entries on the element, mirroring what every real
+        // browser does. We can't share the helper across all
+        // three (the closure for f differs per op), so each
+        // calls `class_list_mutate` and `record_mutation` on
+        // its own.
         let s = shared.clone();
+        let observers_for_cla = observers.clone();
+        let doc_for_cla = doc_for_observers.clone();
         engine.register_host_fn("__elemClassListAdd", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else { return Ok(Value::undefined()) };
             let Some(class) = read_str(vm, args.get(1)) else { return Ok(Value::undefined()) };
-            class_list_mutate(&s, handle, |tokens| {
+            if let Some((nid, old)) = class_list_mutate(&s, handle, |tokens| {
                 if !tokens.iter().any(|t| t == &class) {
                     tokens.push(class.clone());
                 }
-            });
+            }) {
+                record_mutation(
+                    &observers_for_cla,
+                    &doc_for_cla,
+                    MutationRecord {
+                        kind: MutationKind::Attributes,
+                        target: nid,
+                        attribute_name: "class".into(),
+                        old_value: old,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                    },
+                );
+            }
             Ok(Value::undefined())
         });
 
         let s = shared.clone();
+        let observers_for_clr = observers.clone();
+        let doc_for_clr = doc_for_observers.clone();
         engine.register_host_fn("__elemClassListRemove", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else { return Ok(Value::undefined()) };
             let Some(class) = read_str(vm, args.get(1)) else { return Ok(Value::undefined()) };
-            class_list_mutate(&s, handle, |tokens| {
+            if let Some((nid, old)) = class_list_mutate(&s, handle, |tokens| {
                 tokens.retain(|t| t != &class);
-            });
+            }) {
+                record_mutation(
+                    &observers_for_clr,
+                    &doc_for_clr,
+                    MutationRecord {
+                        kind: MutationKind::Attributes,
+                        target: nid,
+                        attribute_name: "class".into(),
+                        old_value: old,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                    },
+                );
+            }
             Ok(Value::undefined())
         });
 
         let s = shared.clone();
+        let observers_for_clt = observers.clone();
+        let doc_for_clt = doc_for_observers.clone();
         engine.register_host_fn("__elemClassListToggle", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else { return Ok(Value::boolean(false)) };
             let Some(class) = read_str(vm, args.get(1)) else { return Ok(Value::boolean(false)) };
             let mut now_present = false;
-            class_list_mutate(&s, handle, |tokens| {
+            if let Some((nid, old)) = class_list_mutate(&s, handle, |tokens| {
                 if let Some(pos) = tokens.iter().position(|t| t == &class) {
                     tokens.remove(pos);
                     now_present = false;
@@ -1444,7 +1482,20 @@ impl BindingContext {
                     tokens.push(class.clone());
                     now_present = true;
                 }
-            });
+            }) {
+                record_mutation(
+                    &observers_for_clt,
+                    &doc_for_clt,
+                    MutationRecord {
+                        kind: MutationKind::Attributes,
+                        target: nid,
+                        attribute_name: "class".into(),
+                        old_value: old,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                    },
+                );
+            }
             Ok(Value::boolean(now_present))
         });
 
@@ -1932,16 +1983,25 @@ impl BindingContext {
 /// into tokens, run the mutator over the token list, write it back.
 /// Dirty is tripped only if the serialised class string actually
 /// changed.
-fn class_list_mutate<F>(shared: &Arc<Mutex<DomShared>>, handle: Value, f: F)
+/// Returns `Some((NodeId, old_class_string))` when the class
+/// attribute actually changed, so the caller can fire a
+/// MutationRecord. `None` when the element doesn't resolve or
+/// the mutation was a no-op (e.g. `classList.add('x')` on an
+/// element that already has `x`).
+fn class_list_mutate<F>(
+    shared: &Arc<Mutex<DomShared>>,
+    handle: Value,
+    f: F,
+) -> Option<(NodeId, String)>
 where
     F: FnOnce(&mut Vec<String>),
 {
     let dom = shared.lock().unwrap();
-    let Some(nid) = dom.node_for_handle(handle) else { return };
-    let changed;
+    let nid = dom.node_for_handle(handle)?;
+    let result;
     {
         let mut d = dom.doc_handle.lock().unwrap();
-        let Some(elem) = d.element_mut(nid) else { return };
+        let elem = d.element_mut(nid)?;
         let mut tokens: Vec<String> = elem
             .get_attr("class")
             .map(|s| s.split_ascii_whitespace().map(String::from).collect())
@@ -1950,18 +2010,17 @@ where
         f(&mut tokens);
         let after = tokens.join(" ");
         if before == after {
-            return;
+            return None;
         }
         if tokens.is_empty() {
             elem.remove_attr("class");
         } else {
             elem.set_attr("class", &after);
         }
-        changed = true;
+        result = Some((nid, before));
     }
-    if changed {
-        dom.mark_dirty();
-    }
+    dom.mark_dirty();
+    result
 }
 
 /// Mint a host-tagged Zinc handle from inside a host-fn closure.
