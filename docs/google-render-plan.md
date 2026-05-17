@@ -71,6 +71,35 @@ is `Cannot read properties of undefined (reading 'call')`
 on a different code path, still inside the eval'd bundle
 but now several thousand lines deeper.
 
+### Investigation status (latest session)
+
+**Pinned and worked around:** the `sctm is not defined`
+error was a Zinc closure-tracking bug. Patched script #3's
+`function V(a)` to log `typeof sctm` and confirmed it's
+`undefined` (binding genuinely lost). Minimal closure
+repros work fine — the bug needs the full 26 KB script's
+specific declaration sequence. Workaround in the prelude:
+declare `var sctm = false; var sclm = false;` as globals so
+the unbound read resolves to the same value the script
+intended. /search error count dropped from 2 to 1.
+
+**Diagnosed but not pinned:** the `.call` of undefined in
+script #2 is actually `<array> is not a function`. Wrapped
+the eval'd bundle's body in try/catch and caught the
+message: `constructor,hasOwnProperty,isPrototypeOf,
+propertyIsEnumerable,toLocaleString,toString,valueOf is
+not a function`. The receiver is an array of
+Object.prototype's property names. Somewhere the bundle
+gets such an array where it expected a function. The
+bundle doesn't call `Object.getOwnPropertyNames` literally
+— some other path produces the list. Likely candidates: a
+`for…in` loop over `Object.prototype` (Zinc may iterate
+non-enumerable names differently), or `Object.entries` /
+`Object.keys` returning unexpected results in some edge
+case. Pinning requires either binary-patching the bundle
+at each call site or extending Zinc to capture the stack at
+TypeError construction.
+
 ### Investigation status
 
 The two remaining errors on `/search` were each investigated:
