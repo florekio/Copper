@@ -2808,6 +2808,22 @@ var document = {
     }
 };
 function __noop() {}
+// Workaround for a Zinc closure-tracking bug surfaced by
+// google.com /search inline script #3: the script declares
+// `var sctm = false` at the top of an IIFE and reads it
+// from a nested function defined ~25 KB later in the same
+// IIFE. Minimal closure repros work fine in Zinc; this
+// specific script's size or function-declaration ordering
+// drops the binding by the time the inner function reads
+// it. As a temporary unblock — until the closure-scope
+// tracking is fixed in Zinc — promote `sctm` (and a
+// handful of similar minified single-name globals the
+// bundle reads from closure) to real globals so the
+// unbound-identifier read resolves cleanly. The boolean
+// is `false`, matching the bundle's intent (telemetry
+// path stays off).
+var sctm = false;
+var sclm = false;
 // `encodeURIComponent` / `decodeURIComponent` polyfills.
 // Zinc doesn't ship them as builtins, and feature-probe code
 // that calls them bare crashes with "is not defined". UTF-8
