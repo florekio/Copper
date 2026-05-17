@@ -56,12 +56,20 @@ the bundle's real source by joining an array of fragments,
 then passes the result through `(0, eval)(...)`.
 
 The eval'd code references unbound minified names (`J`, `K`,
-…) that the dispatcher was supposed to populate. When the
-state walk doesn't reach the terminal `C==37` branch with
-the expected `n` payload (because something in our engine
-doesn't match what Google's runtime would do), the eval'd
-script references `J` as a free variable and throws
-`ReferenceError: J is not defined` on the first access.
+…) that LOOK like the dispatcher's responsibility but are
+actually function parameters in the eval'd source. The
+ReferenceError was a *symptom*: a Zinc lexer bug
+mis-tokenised `.replace(/=/g, "")` (the regex-start `/=`
+got eaten as `SlashAssign`), cascading into syntax errors
+that broke later function declarations, which surfaced as
+"undefined J" at call sites.
+
+**Fixed (commit `b4f6fa5` in the zinc repo):** the lexer
+now checks regex-start context BEFORE consuming `/=`. With
+that fix, the bundle progresses further — the new failure
+is `Cannot read properties of undefined (reading 'call')`
+on a different code path, still inside the eval'd bundle
+but now several thousand lines deeper.
 
 Tried (didn't work): pre-declaring `var J, K, M, …`
 globally as `undefined` in the prelude. The dispatcher
