@@ -71,6 +71,34 @@ is `Cannot read properties of undefined (reading 'call')`
 on a different code path, still inside the eval'd bundle
 but now several thousand lines deeper.
 
+### Investigation status
+
+The two remaining errors on `/search` were each investigated:
+
+**`'call' of undefined` in script #2:** Grepped every
+`.call(` site in the eval'd source — 20+ distinct receivers
+(`x6`, `h`, `fu`, `forEach`, `ZO`, `WA`, `splice`,
+`preventDefault`, …) each appearing multiple times. Identifying
+which receiver is `undefined` at runtime requires per-line
+instrumentation (wrapping `Function.prototype.call` to log
+when called on undefined, or splitting the eval'd source at
+each call site and bisecting). Out of scope for one session.
+
+**`sctm is not defined` in script #3:** Standalone, the
+script throws `Error("a")` (Math-identity check at line 1)
+because `window` isn't set up. With our prelude (which sets
+`window.Math = Math`), the Math check passes and execution
+proceeds to a callsite that reads `sctm` from closure scope.
+
+Minimal repros of the closure pattern (`(function(){ var
+sctm = false; function V(a) { return sctm; }; V() })()`)
+work fine in Zinc standalone. The full 26 KB script triggers
+the bug; the repro doesn't. Something about size, function
+hoisting order, or some token combination loses the
+binding. No `eval` / `new Function` / `with` is present that
+would explain dynamic scope. A/B bisecting the script while
+preserving syntactic validity is the next investigative step.
+
 ### Where the remaining `/search` errors land
 
 After the lexer fix, two errors remain on `/search`:
