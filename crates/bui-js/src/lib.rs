@@ -189,18 +189,17 @@ impl JsContext {
             // actual rendering code (Google's xjs, React's
             // app.js, every CDN'd bundle).
             //
-            // Size cap: 256 KB. Google's xjs bundle is 1MB+ of
-            // Closure-compiled output; running it through Zinc
-            // burns through `set_max_steps` (50M) without ever
-            // resolving and effectively hangs the browser
-            // thread. Until the engine can handle bundles of
-            // that size — or until we ship a real closure-
-            // library shim that lets the bundle short-circuit
-            // its bootstrap — capping at 256 KB lets the
-            // typical CDN-hosted React/Vue app run while
-            // skipping the giant minified payloads. The
-            // outcome record carries the skip so the dev-dock
-            // Console shows what happened.
+            // Size cap. Two failure modes for huge bundles:
+            // 256 KB+ runs Zinc into its 50 M `max_steps`
+            // budget and the eval slowly resolves to an error
+            // outcome (fine). 1 MB+ trips a Zinc crash —
+            // SIGTRAP (exit 133), most likely a stack
+            // overflow in the parser or VM frame setup on
+            // the giant compiled output. Until Zinc fixes
+            // that path, capping at 256 KB keeps the browser
+            // alive on Google-shaped pages. Smaller React /
+            // Vue / Svelte bundles fit and run to
+            // completion.
             const EXTERNAL_SCRIPT_CAP: usize = 256 * 1024;
             let source: String = match source {
                 ScriptSource::Inline(s) => s,
