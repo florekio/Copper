@@ -83,8 +83,15 @@ declare `var sctm = false; var sclm = false;` as globals so
 the unbound read resolves to the same value the script
 intended. /search error count dropped from 2 to 1.
 
-**Diagnosed but not pinned:** the `.call` of undefined in
-script #2 is actually `<array> is not a function`. Wrapped
+**Diagnosed with line info, still in eval'd code:** the
+remaining error now reports `(at line 0, pc 13)` thanks to
+Zinc's new source-location annotations on TypeError messages
+(commit `688bd4e` in the Zinc repo). Line 0 means the error
+is in a dynamically-eval'd chunk where source-line mapping
+isn't populated; pc 13 means very near the start of that
+chunk's bytecode. So the failing call site is in the first
+~13 bytes of the eval'd bundle's bytecode — narrows the
+search dramatically. Wrapped
 the eval'd bundle's body in try/catch and caught the
 message: `constructor,hasOwnProperty,isPrototypeOf,
 propertyIsEnumerable,toLocaleString,toString,valueOf is
