@@ -193,10 +193,31 @@ pub struct FetchResponse {
 /// request couldn't be issued at all.
 pub type Fetcher = Arc<dyn Fn(&str) -> Option<FetchResponse> + Send + Sync>;
 
+/// One scheduled timer / repeating interval / requestAnimationFrame
+/// callback. The embedder's frame-tick drains entries whose `when`
+/// has elapsed and re-enqueues anything with a non-`None`
+/// `repeat`.
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledTimer {
+    pub id: u32,
+    pub when: std::time::Instant,
+    pub callback: zinc::runtime::value::Value,
+    /// `Some` for `setInterval`; the timer re-enqueues itself at
+    /// `now + repeat` after firing. `None` for `setTimeout` /
+    /// `requestAnimationFrame`.
+    pub repeat: Option<std::time::Duration>,
+}
+
 pub struct BindingContext {
     shared: Arc<Mutex<DomShared>>,
     elem_tag: HostTag,
     dirty: Arc<AtomicBool>,
+    /// Pending `setTimeout` / `setInterval` callbacks. Drained
+    /// by the embedder each frame via `JsContext::tick`. Locked
+    /// briefly per scheduler call; held across the JS callback
+    /// would deadlock if the callback itself schedules a new
+    /// timer.
+    timers: Arc<Mutex<Vec<ScheduledTimer>>>,
     /// URL JS asked us to navigate to via `location.href = ...` (or
     /// `location.assign(...)` / `location.replace(...)`). Drained
     /// once by the embedder after the script pass completes.
@@ -1294,6 +1315,91 @@ impl BindingContext {
             Ok(Value::null())
         });
 
+        // ---- Timer scheduler ----
+        //
+        // `__setTimeoutHost(fn, ms)` and `__setIntervalHost(fn,
+        // ms)` push onto a shared timer queue that the embedder
+        // drains each frame via `JsContext::tick(now)`. They
+        // return a monotonic id the script can pass to
+        // `clearTimeout` / `clearInterval` to cancel.
+        //
+        // Pure-JS code calling `setTimeout(fn, 0)` still gets
+        // the synchronous-during-prelude shape because we
+        // schedule the timer for "now"; the next tick fires
+        // it. That delay is at most one frame (~16 ms) which
+        // matches what real browsers do for `setTimeout(fn, 0)`.
+        let timers: Arc<Mutex<Vec<ScheduledTimer>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let next_timer_id =
+            Arc::new(std::sync::atomic::AtomicU32::new(1));
+
+        let timers_for_set = timers.clone();
+        let id_for_set = next_timer_id.clone();
+        engine.register_host_fn("__setTimeoutHost", move |_vm, _this, args| {
+            let Some(cb) = args.first().copied() else { return Ok(Value::int(0)) };
+            if !cb.is_function() && !cb.is_object() {
+                return Ok(Value::int(0));
+            }
+            let ms = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(0.0);
+            let when = std::time::Instant::now()
+                + std::time::Duration::from_micros((ms * 1000.0) as u64);
+            let id = id_for_set.fetch_add(1, Ordering::SeqCst);
+            timers_for_set.lock().unwrap().push(ScheduledTimer {
+                id,
+                when,
+                callback: cb,
+                repeat: None,
+            });
+            Ok(Value::int(id as i32))
+        });
+
+        let timers_for_int = timers.clone();
+        let id_for_int = next_timer_id.clone();
+        engine.register_host_fn("__setIntervalHost", move |_vm, _this, args| {
+            let Some(cb) = args.first().copied() else { return Ok(Value::int(0)) };
+            if !cb.is_function() && !cb.is_object() {
+                return Ok(Value::int(0));
+            }
+            let ms = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0).max(4.0);
+            let repeat = std::time::Duration::from_micros((ms * 1000.0) as u64);
+            let id = id_for_int.fetch_add(1, Ordering::SeqCst);
+            timers_for_int.lock().unwrap().push(ScheduledTimer {
+                id,
+                when: std::time::Instant::now() + repeat,
+                callback: cb,
+                repeat: Some(repeat),
+            });
+            Ok(Value::int(id as i32))
+        });
+
+        let timers_for_clear = timers.clone();
+        engine.register_host_fn("__clearTimerHost", move |_vm, _this, args| {
+            let Some(id) = args.first().and_then(|v| v.as_number()) else {
+                return Ok(Value::null());
+            };
+            let target = id as u32;
+            let mut t = timers_for_clear.lock().unwrap();
+            t.retain(|e| e.id != target);
+            Ok(Value::null())
+        });
+
+        // requestAnimationFrame schedules a one-shot callback
+        // for the next paint frame. We approximate that by
+        // queueing for "now" — the next `tick` fires it.
+        let timers_for_raf = timers.clone();
+        let id_for_raf = next_timer_id.clone();
+        engine.register_host_fn("__requestAnimationFrameHost", move |_vm, _this, args| {
+            let Some(cb) = args.first().copied() else { return Ok(Value::int(0)) };
+            let id = id_for_raf.fetch_add(1, Ordering::SeqCst);
+            timers_for_raf.lock().unwrap().push(ScheduledTimer {
+                id,
+                when: std::time::Instant::now(),
+                callback: cb,
+                repeat: None,
+            });
+            Ok(Value::int(id as i32))
+        });
+
         // ---- JS prelude wrapping the `__` host fns ----
         let _ = engine.eval(PRELUDE);
 
@@ -1317,6 +1423,7 @@ impl BindingContext {
             event_flags,
             prevent_default_fn,
             stop_propagation_fn,
+            timers,
         }
     }
 
@@ -1362,6 +1469,14 @@ impl BindingContext {
     /// real host object instead of `null`.
     pub fn handle_for_node(&self, nid: NodeId) -> Option<Value> {
         self.shared.lock().ok()?.handle_for(nid)
+    }
+
+    /// Shared timer queue — `setTimeout` / `setInterval` /
+    /// `requestAnimationFrame` callbacks waiting to fire. The
+    /// embedder drains it each frame tick via
+    /// `JsContext::tick(now)`.
+    pub(crate) fn timers(&self) -> Arc<Mutex<Vec<ScheduledTimer>>> {
+        self.timers.clone()
     }
 
     /// Build a fresh `EventDispatchCtx` for one dispatch — the
@@ -1731,24 +1846,30 @@ var document = {
     cookie: ''
 };
 function __noop() {}
-// setTimeout shim. We don't have a real timer queue; the common
-// pattern in real-world code is `setTimeout(fn, 0)` as a
-// microtask shim, which we honour by firing synchronously.
-// Non-zero delays are dropped — a future phase swaps this for a
-// per-tab timer queue drained between paint frames.
+// Timer scheduling now routes through host fns that push onto
+// a shared queue; the embedder's frame tick drains entries
+// whose deadline has elapsed. `setTimeout(fn, 0)` therefore
+// fires at most one frame (~16 ms) later, matching what real
+// browsers do for zero-delay timers.
 function setTimeout(fn, ms) {
-    if ((ms || 0) <= 0 && typeof fn === 'function') {
-        try { fn(); } catch (e) {}
-    }
-    return 0;
+    return __setTimeoutHost(fn, ms || 0);
 }
+function clearTimeout(id) { __clearTimerHost(id); }
+function setInterval(fn, ms) {
+    return __setIntervalHost(fn, ms || 0);
+}
+function clearInterval(id) { __clearTimerHost(id); }
 function requestAnimationFrame(fn) {
-    if (typeof fn === 'function') {
-        try { fn(0); } catch (e) {}
-    }
-    return 0;
+    return __requestAnimationFrameHost(fn);
 }
+function cancelAnimationFrame(id) { __clearTimerHost(id); }
 function queueMicrotask(fn) {
+    // Microtasks aren't macrotasks — running them synchronously
+    // is still strictly better than queueing them onto the
+    // timer queue, which would defer to the next frame. Real
+    // queueMicrotask semantics require draining after the
+    // current synchronous task; for now we accept "fire now"
+    // since user code typically doesn't observe the difference.
     if (typeof fn === 'function') {
         try { fn(); } catch (e) {}
     }
@@ -1840,8 +1961,11 @@ var window = {
     history: history,
     fetch: fetch,
     setTimeout: setTimeout,
-    clearTimeout: __noop,
+    clearTimeout: clearTimeout,
+    setInterval: setInterval,
+    clearInterval: clearInterval,
     requestAnimationFrame: requestAnimationFrame,
+    cancelAnimationFrame: cancelAnimationFrame,
     addEventListener: __ael,
     removeEventListener: __noop,
     innerWidth: 1400,
@@ -2232,27 +2356,12 @@ mod tests {
         assert!(ctx.dirty().load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn set_timeout_zero_fires_synchronously() {
-        // Phase 5: setTimeout(fn, 0) fires immediately. Non-zero
-        // delays are dropped. The common real-world pattern is
-        // `setTimeout(fn, 0)` as a microtask shim, which works.
-        let mut engine = Engine::new();
-        let doc = wrapped_doc("<body></body>");
-        let _ctx = BindingContext::install(&mut engine, doc, String::new());
-        engine
-            .eval(
-                "var fired = 0; \
-                 var queued = 0; \
-                 setTimeout(function(){ fired = fired + 1; }, 0); \
-                 setTimeout(function(){ queued = queued + 1; }, 100);",
-            )
-            .expect("eval");
-        let (fired, _) = engine.eval_with_output("fired");
-        let (queued, _) = engine.eval_with_output("queued");
-        assert_eq!(fired, "1", "ms=0 should fire synchronously");
-        assert_eq!(queued, "0", "ms>0 is dropped in this phase");
-    }
+    // Obsolete: the Phase-5 `setTimeout(fn, 0)` synchronous-fire
+    // shim was replaced by a real per-context timer queue in
+    // a subsequent slice; setTimeout(fn, 0) now queues for the
+    // next `JsContext::tick`. Coverage moved to the
+    // `set_timeout_with_delay_fires_when_tick_passes_deadline`
+    // and `clear_timeout_cancels_pending` tests in `tests::`.
 
     #[test]
     fn fetch_routes_through_embedder_supplied_fetcher() {

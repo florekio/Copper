@@ -252,6 +252,73 @@ impl JsContext {
         let _ = self.engine.vm().drain_microtasks();
     }
 
+    /// Per-frame tick: fire every `setTimeout` / `setInterval` /
+    /// `requestAnimationFrame` callback whose deadline elapsed
+    /// at or before `now`, then drain queued microtasks. The
+    /// embedder calls this each frame from its render loop —
+    /// without it, scheduled work piles up forever and pages
+    /// that rely on delayed callbacks (most of them) stall.
+    ///
+    /// Repeating intervals re-enqueue themselves at `now +
+    /// repeat` after firing. A timer whose `clearTimeout` was
+    /// called between scheduling and firing is already gone
+    /// from the queue (we drain by removing matched entries),
+    /// so this loop never needs to consult a separate set of
+    /// cancellations.
+    pub fn tick(&mut self, now: std::time::Instant) {
+        let due: Vec<crate::dom_bindings::ScheduledTimer> = {
+            let timers = self.bindings.timers();
+            let mut t = timers.lock().unwrap();
+            let mut kept = Vec::with_capacity(t.len());
+            let mut due = Vec::new();
+            for entry in t.drain(..) {
+                if entry.when <= now {
+                    due.push(entry);
+                } else {
+                    kept.push(entry);
+                }
+            }
+            *t = kept;
+            due
+        };
+        // Sort by deadline so earlier timers fire first. Two
+        // setTimeouts with the same `when` fire in insertion
+        // order — Vec::sort_by is stable so that holds.
+        let mut due = due;
+        due.sort_by_key(|e| e.when);
+        for entry in due {
+            // Use host_call so a JS exception thrown inside the
+            // callback comes back as Err and we route it to the
+            // console buffer rather than panicking the host.
+            if self
+                .engine
+                .vm()
+                .host_call(entry.callback, &[])
+                .is_err()
+            {
+                self.engine
+                    .vm()
+                    .output
+                    .push("Uncaught exception in scheduled timer callback".into());
+            }
+            // Re-enqueue intervals.
+            if let Some(repeat) = entry.repeat {
+                let next = now + repeat;
+                self.bindings
+                    .timers()
+                    .lock()
+                    .unwrap()
+                    .push(crate::dom_bindings::ScheduledTimer {
+                        id: entry.id,
+                        when: next,
+                        callback: entry.callback,
+                        repeat: Some(repeat),
+                    });
+            }
+        }
+        let _ = self.engine.vm().drain_microtasks();
+    }
+
     /// Return — and consume — every console line the VM has
     /// pushed since the previous drain. Includes:
     /// - `console.log` / `console.warn` / `console.error` lines
@@ -520,6 +587,68 @@ mod tests {
         // And we observe the side-effect of the handler running.
         let (fired, _) = ctx.engine.eval_with_output("fired");
         assert_eq!(fired, "1");
+    }
+
+    /// Real `setTimeout` with a delay: a script schedules a
+    /// 50 ms timer; calling `tick(now)` with `now` before the
+    /// deadline doesn't fire it, calling `tick` past the
+    /// deadline does. Locks in that the timer-queue
+    /// integration actually wires both directions.
+    #[test]
+    fn set_timeout_with_delay_fires_when_tick_passes_deadline() {
+        use std::time::{Duration, Instant};
+
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "globalThis.fired = 0;\n\
+             setTimeout(function(){ globalThis.fired = 1; }, 50);",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+
+        // Immediately after install: the 50 ms timer is queued
+        // but not yet due. tick(now) leaves it pending.
+        ctx.tick(Instant::now());
+        let (before, _) = ctx.engine.eval_with_output("fired");
+        assert_eq!(before, "0");
+
+        // 100 ms in the future is past the deadline → fires.
+        ctx.tick(Instant::now() + Duration::from_millis(100));
+        let (after, _) = ctx.engine.eval_with_output("fired");
+        assert_eq!(after, "1");
+    }
+
+    /// clearTimeout cancels a pending timer before it fires.
+    #[test]
+    fn clear_timeout_cancels_pending() {
+        use std::time::{Duration, Instant};
+
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "globalThis.fired = 0;\n\
+             var id = setTimeout(function(){ globalThis.fired = 1; }, 50);\n\
+             clearTimeout(id);",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+
+        ctx.tick(Instant::now() + Duration::from_millis(100));
+        let (fired, _) = ctx.engine.eval_with_output("fired");
+        assert_eq!(fired, "0");
     }
 
     /// Event-handler runtime exceptions are routed into the

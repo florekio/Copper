@@ -1757,6 +1757,25 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         // Window close is handled by winit on next event; nothing to paint.
         return dl;
     }
+    // Per-frame JS tick: fire every setTimeout / setInterval /
+    // requestAnimationFrame callback whose deadline has elapsed,
+    // then drain microtasks. Surfaces any console output / errors
+    // into TabState.console_log so the dev-dock Console renders
+    // them. Trips `last_width = 0` if a timer mutated the DOM so
+    // the layout pass below re-builds against the new state.
+    {
+        let tab = st.active_tab_mut();
+        if let Some(ctx) = tab.js_ctx.as_mut() {
+            ctx.tick(std::time::Instant::now());
+            for line in ctx.take_console_lines() {
+                eprintln!("[js] {line}");
+                tab.console_log.push(line);
+            }
+            if ctx.take_dirty() {
+                tab.last_width = 0;
+            }
+        }
+    }
     let active = st.active;
     let tab_count = st.tabs.len();
     let tabs_meta: Vec<(String, bool)> = st
