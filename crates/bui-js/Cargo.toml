@@ -8,10 +8,8 @@ publish.workspace = true
 [dependencies]
 bui-css = { path = "../bui-css" }
 bui-dom = { path = "../bui-dom" }
-zinc = { path = "../../../browser" }
-
-[dev-dependencies]
 bui-html = { path = "../bui-html" }
+zinc = { path = "../../../browser" }
 
 [lints]
 workspace = true

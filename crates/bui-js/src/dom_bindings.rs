@@ -195,6 +195,115 @@ fn subscription_matches(
     false
 }
 
+/// Walk `doc` and return the first `<body>` element, or
+/// `None` if the parsed fragment didn't reach one. Used by
+/// `__elemSetInnerHtml` to peel off the synthesized html /
+/// head / body wrappers around fragment content.
+fn find_body_in(doc: &Document) -> Option<NodeId> {
+    for nid in doc.descendants(doc.root) {
+        if let Some(elem) = doc.element(nid)
+            && elem.name == "body"
+        {
+            return Some(nid);
+        }
+    }
+    None
+}
+
+/// Clone `src_id` (and its subtree) from `src_doc` into
+/// `dst_doc` as a child of `dst_parent`. Element attributes are
+/// copied verbatim; text and comment payloads carry through.
+/// Returns the new NodeId in `dst_doc`. Used by
+/// `__elemSetInnerHtml` to materialise parsed fragment content
+/// into the live document.
+fn clone_subtree_into(
+    src_doc: &Document,
+    src_id: NodeId,
+    dst_parent: NodeId,
+    dst_doc: &mut Document,
+) -> Option<NodeId> {
+    let new_id = match &src_doc.node(src_id).kind {
+        NodeKind::Element(e) => {
+            let id = dst_doc.create_element(&e.name);
+            if let Some(elem) = dst_doc.element_mut(id) {
+                for (k, v) in &e.attrs {
+                    elem.set_attr(k, v);
+                }
+            }
+            id
+        }
+        NodeKind::Text(t) => dst_doc.create_text(t),
+        NodeKind::Comment(c) => dst_doc.create_comment(c),
+        NodeKind::Doctype { .. } | NodeKind::Document => return None,
+    };
+    dst_doc.append_child(dst_parent, new_id);
+    let mut child = src_doc.node(src_id).first_child;
+    while let Some(id) = child {
+        let next = src_doc.node(id).next_sibling;
+        clone_subtree_into(src_doc, id, new_id, dst_doc);
+        child = next;
+    }
+    Some(new_id)
+}
+
+/// Re-serialise a node and its subtree back to HTML. The
+/// inverse of the parser, with one notable simplification:
+/// every element is written as the long open/close form
+/// (`<br></br>`) rather than the void-element short form
+/// (`<br>`) — round-tripping via the parser still works, and
+/// the alternative would require maintaining a void-element
+/// list synced with the parser's. Attribute values are
+/// double-quoted with `"` → `&quot;` escape; text content
+/// escapes `&`, `<`, `>`.
+fn serialise_node(doc: &Document, id: NodeId, out: &mut String) {
+    match &doc.node(id).kind {
+        NodeKind::Element(e) => {
+            out.push('<');
+            out.push_str(&e.name);
+            for (k, v) in &e.attrs {
+                out.push(' ');
+                out.push_str(k);
+                out.push_str("=\"");
+                out.push_str(&v.replace('&', "&amp;").replace('"', "&quot;"));
+                out.push('"');
+            }
+            out.push('>');
+            let mut child = doc.node(id).first_child;
+            while let Some(c) = child {
+                serialise_node(doc, c, out);
+                child = doc.node(c).next_sibling;
+            }
+            out.push_str("</");
+            out.push_str(&e.name);
+            out.push('>');
+        }
+        NodeKind::Text(t) => {
+            let escaped = t
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            out.push_str(&escaped);
+        }
+        NodeKind::Comment(c) => {
+            out.push_str("<!--");
+            out.push_str(c);
+            out.push_str("-->");
+        }
+        NodeKind::Doctype { name, .. } => {
+            out.push_str("<!DOCTYPE ");
+            out.push_str(name);
+            out.push('>');
+        }
+        NodeKind::Document => {
+            let mut child = doc.node(id).first_child;
+            while let Some(c) = child {
+                serialise_node(doc, c, out);
+                child = doc.node(c).next_sibling;
+            }
+        }
+    }
+}
+
 /// Convert a CSS / HTML kebab-case identifier (`font-size`,
 /// `data-foo-bar`) to JS camelCase (`fontSize`, `fooBar`).
 /// Each `-x` becomes `X`. Used by the `dataset` getter to
@@ -1150,13 +1259,111 @@ impl BindingContext {
 
         // ----- Write side (Tier 1 §1) -----
 
+        // `__elemSetInnerHtml(handle, html)` parses `html` via
+        // bui-html and replaces the element's children with the
+        // parsed fragment. Modern templating code does this
+        // constantly — `el.innerHTML = '<span>x</span>'`. We
+        // don't have a fragment parser per se, so we use the
+        // full-document parser and pull out the body's
+        // children (the synthesized html/head/body wrappers
+        // get dropped on the floor).
         let s = shared.clone();
+        let observers_for_ih = observers.clone();
+        let doc_for_ih = doc_for_observers.clone();
+        engine.register_host_fn("__elemSetInnerHtml", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(Value::undefined());
+            };
+            let html = read_str(vm, args.get(1)).unwrap_or_default();
+            let dom = s.lock().unwrap();
+            let Some(target) = dom.node_for_handle(handle) else {
+                return Ok(Value::undefined());
+            };
+            // Parse the fragment via the full HTML parser.
+            // `bui_html::parse` wraps everything in synthesized
+            // <html>/<head>/<body>, so we hunt for the body and
+            // copy its children into the target. For fragments
+            // that don't reach a body (e.g. just text), we fall
+            // back to the document root's children.
+            let parsed = bui_html::parse(&html);
+            {
+                let mut d = dom.doc_handle.lock().unwrap();
+                // Detach existing children before reattaching
+                // the fragment. Collect the ids up front because
+                // `detach` mutates sibling links.
+                let mut child = d.node(target).first_child;
+                let mut to_detach = Vec::new();
+                while let Some(id) = child {
+                    to_detach.push(id);
+                    child = d.node(id).next_sibling;
+                }
+                for id in to_detach {
+                    d.detach(id);
+                }
+                // Locate the source root (parsed body, fall
+                // through to root if none) and clone-append
+                // each of its element/text children.
+                let src_root = find_body_in(&parsed).unwrap_or(parsed.root);
+                let mut child = parsed.node(src_root).first_child;
+                while let Some(id) = child {
+                    let next = parsed.node(id).next_sibling;
+                    clone_subtree_into(&parsed, id, target, &mut d);
+                    child = next;
+                }
+            }
+            dom.mark_dirty();
+            drop(dom);
+            // One childList record covers the whole replacement.
+            record_mutation(
+                &observers_for_ih,
+                &doc_for_ih,
+                MutationRecord {
+                    kind: MutationKind::ChildList,
+                    target,
+                    attribute_name: String::new(),
+                    old_value: String::new(),
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                },
+            );
+            Ok(Value::undefined())
+        });
+
+        // `__elemGetInnerHtml(handle)` walks the element's
+        // children and re-serialises them. Cheap for typical
+        // template-rendered subtrees; not optimised for huge
+        // DOMs.
+        let s2 = shared.clone();
+        engine.register_host_fn("__elemGetInnerHtml", move |vm, _this, args| {
+            let s = &s2;
+            let Some(handle) = args.first().copied() else {
+                return Ok(vm.value_from_str(""));
+            };
+            let dom = s.lock().unwrap();
+            let Some(target) = dom.node_for_handle(handle) else {
+                return Ok(vm.value_from_str(""));
+            };
+            let html = {
+                let d = dom.doc_handle.lock().unwrap();
+                let mut out = String::new();
+                let mut child = d.node(target).first_child;
+                while let Some(id) = child {
+                    serialise_node(&d, id, &mut out);
+                    child = d.node(id).next_sibling;
+                }
+                out
+            };
+            drop(dom);
+            Ok(vm.value_from_str(&html))
+        });
+
         // For attribute / childList mutations we capture the
         // pre-mutation state inside the existing locked
         // section, then drop locks and call `record_mutation`
         // afterwards. Calling it under the doc lock would
         // re-enter the same Mutex when a MutationObserver
         // callback later reads the DOM via a host fn.
+        let s = shared.clone();
         let observers_for_set = observers.clone();
         let doc_for_set = doc_for_observers.clone();
         engine.register_host_fn("__elemSetAttr", move |vm, _this, args| {
@@ -2087,6 +2294,26 @@ function _wrapElem(handle) {
         get className() { return __elemClassName(this._h); },
         get textContent() { return __elemTextContent(this._h); },
         set textContent(v) { __elemSetTextContent(this._h, v); },
+        // innerHTML — every templating library reaches for it.
+        // Getter serialises the element's subtree back to HTML;
+        // setter parses the string as a fragment and replaces
+        // children. Void-element semantics are *not* honoured
+        // by the serialiser — every element round-trips as
+        // `<tag></tag>` rather than `<tag>`, which the parser
+        // accepts cleanly so reads of subsequent writes match.
+        get innerHTML() { return __elemGetInnerHtml(this._h); },
+        set innerHTML(v) { __elemSetInnerHtml(this._h, v == null ? '' : String(v)); },
+        // outerHTML wraps the element's own open + inner +
+        // close. Getter is straightforward; setter is more
+        // involved (it has to replace the node in its parent's
+        // children), which the spec deems out of scope here —
+        // we just no-op the setter.
+        get outerHTML() {
+            var open = '<' + this.tagName.toLowerCase();
+            var attrs = ''; // we don't expose .attributes yet
+            return open + '>' + this.innerHTML + '</' + this.tagName.toLowerCase() + '>';
+        },
+        set outerHTML(_v) {},
         get parentElement() {
             return _wrapElem(__elemParent(this._h));
         },
@@ -3253,6 +3480,65 @@ mod tests {
             "document.querySelector('#p1').childNodes[0].nodeName",
         );
         assert_eq!(name, "#text");
+    }
+
+    #[test]
+    fn inner_html_setter_parses_fragment_into_children() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body><div id='d'><span>old</span></div></body>");
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        engine
+            .eval(
+                "document.querySelector('#d').innerHTML = '<p class=\"x\">hello <em>world</em></p>'",
+            )
+            .expect("eval");
+
+        // The DOM reflects the new subtree.
+        let d = doc.lock().unwrap();
+        let div = d
+            .descendants(d.root)
+            .find(|n| d.element(*n).map(|e| e.name == "div").unwrap_or(false))
+            .expect("div");
+        let mut child_names: Vec<String> = Vec::new();
+        let mut child = d.node(div).first_child;
+        while let Some(id) = child {
+            if let Some(e) = d.element(id) {
+                child_names.push(e.name.clone());
+            }
+            child = d.node(id).next_sibling;
+        }
+        assert_eq!(child_names, vec!["p".to_string()]);
+
+        // The <span>old</span> child is detached (still in the
+        // node arena but no longer parented under the div).
+        let p = d
+            .descendants(d.root)
+            .find(|n| d.element(*n).map(|e| e.name == "p").unwrap_or(false))
+            .expect("p");
+        assert_eq!(
+            d.element(p).and_then(|e| e.get_attr("class")),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn inner_html_getter_serialises_subtree() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc(
+            "<body><div id='d'><p class='x'>hi <em>there</em></p></div></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        let (got, _) = engine.eval_with_output(
+            "document.querySelector('#d').innerHTML",
+        );
+        // Long-form open/close, attribute escaping, text
+        // round-trip. Slight loss vs. the source (em wraps
+        // contiguous text → serialiser puts `there` inside).
+        assert!(got.contains("<p class=\"x\">"), "got: {got}");
+        assert!(got.contains("<em>there</em>"), "got: {got}");
+        assert!(got.contains("hi "), "got: {got}");
     }
 
     #[test]
