@@ -89,6 +89,30 @@ impl DomShared {
     fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::SeqCst);
     }
+
+    /// Look up or lazily allocate a host handle for `node`.
+    /// `BindingContext::install` pre-allocates handles for every
+    /// element in the initial DOM, but text nodes don't get
+    /// handles until JS first walks into one via firstChild /
+    /// nextSibling / etc. `ensure_handle(None, …)` returns
+    /// `Value::null()` so traversal getters can pass through
+    /// the `Option<NodeId>` they read from `bui-dom` unchanged.
+    fn ensure_handle(
+        &mut self,
+        node: Option<NodeId>,
+        vm: &mut zinc::vm::vm::Vm,
+        elem_tag: zinc::engine::HostTag,
+    ) -> Value {
+        let Some(nid) = node else { return Value::null() };
+        if let Some(h) = self.handles_by_node.get(&nid).copied()
+            && !h.is_null()
+        {
+            return h;
+        }
+        let h = vm.alloc_host_object(elem_tag.0, nid.0 as u64);
+        self.handles_by_node.insert(nid, h);
+        h
+    }
 }
 
 /// Convert a CSS / HTML kebab-case identifier (`font-size`,
@@ -502,6 +526,135 @@ impl BindingContext {
         // round-trip to the DOM today; use `setAttribute(
         // 'data-foo', 'x')` for the write path until we have a
         // Proxy-based surface.
+        // ---- Node tree (any node, not just elements) ----
+        //
+        // Element handles are pre-allocated at install time
+        // above; text nodes get a host handle on first access
+        // through these traversal getters. We use the same
+        // `elem_tag` for text nodes so the wrapper code stays
+        // single-shape; methods like getAttribute / setAttribute
+        // become silent no-ops on a text node (they look up
+        // `d.element(nid)` which returns None). The minimal
+        // surface JS code uses on text nodes — nodeType,
+        // nodeName, nodeValue, parentElement, nextSibling — all
+        // work because they read `d.node(nid)` directly.
+        let elem_tag_for_node = elem_tag;
+        let s = shared.clone();
+        engine.register_host_fn("__nodeFirstChild", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(Value::null()) };
+            let mut dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else { return Ok(Value::null()) };
+            let child = dom.doc_handle.lock().unwrap().node(nid).first_child;
+            Ok(dom.ensure_handle(child, vm, elem_tag_for_node))
+        });
+        let s = shared.clone();
+        engine.register_host_fn("__nodeLastChild", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(Value::null()) };
+            let mut dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else { return Ok(Value::null()) };
+            // bui-dom doesn't carry a `last_child` slot — walk
+            // from first_child to the tail (cheap for the small
+            // sibling lists JS code typically iterates).
+            let mut last = None;
+            {
+                let d = dom.doc_handle.lock().unwrap();
+                let mut c = d.node(nid).first_child;
+                while let Some(id) = c {
+                    last = Some(id);
+                    c = d.node(id).next_sibling;
+                }
+            }
+            Ok(dom.ensure_handle(last, vm, elem_tag_for_node))
+        });
+        let s = shared.clone();
+        engine.register_host_fn("__nodeNextSibling", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(Value::null()) };
+            let mut dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else { return Ok(Value::null()) };
+            let sib = dom.doc_handle.lock().unwrap().node(nid).next_sibling;
+            Ok(dom.ensure_handle(sib, vm, elem_tag_for_node))
+        });
+        let s = shared.clone();
+        engine.register_host_fn("__nodePrevSibling", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(Value::null()) };
+            let mut dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else { return Ok(Value::null()) };
+            // No `prev_sibling` slot in bui-dom either; walk
+            // the parent's child list to find the one before us.
+            let mut prev = None;
+            {
+                let d = dom.doc_handle.lock().unwrap();
+                let parent = d.node(nid).parent;
+                if let Some(p) = parent {
+                    let mut c = d.node(p).first_child;
+                    while let Some(id) = c {
+                        if id == nid {
+                            break;
+                        }
+                        prev = Some(id);
+                        c = d.node(id).next_sibling;
+                    }
+                }
+            }
+            Ok(dom.ensure_handle(prev, vm, elem_tag_for_node))
+        });
+        let s = shared.clone();
+        engine.register_host_fn("__nodeType", move |_vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(Value::int(0)) };
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else { return Ok(Value::int(0)) };
+            let d = dom.doc_handle.lock().unwrap();
+            // DOM spec node-type constants:
+            // ELEMENT_NODE=1, TEXT_NODE=3, COMMENT_NODE=8,
+            // DOCUMENT_NODE=9, DOCUMENT_TYPE_NODE=10.
+            let ty = match &d.node(nid).kind {
+                NodeKind::Element(_) => 1,
+                NodeKind::Text(_) => 3,
+                NodeKind::Comment(_) => 8,
+                NodeKind::Document => 9,
+                NodeKind::Doctype { .. } => 10,
+            };
+            Ok(Value::int(ty))
+        });
+        let s = shared.clone();
+        engine.register_host_fn("__nodeName", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(vm.value_from_str("")) };
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else {
+                return Ok(vm.value_from_str(""));
+            };
+            let name = {
+                let d = dom.doc_handle.lock().unwrap();
+                match &d.node(nid).kind {
+                    NodeKind::Element(e) => e.name.to_ascii_uppercase(),
+                    NodeKind::Text(_) => "#text".to_string(),
+                    NodeKind::Comment(_) => "#comment".to_string(),
+                    NodeKind::Document => "#document".to_string(),
+                    NodeKind::Doctype { name, .. } => name.clone(),
+                }
+            };
+            drop(dom);
+            Ok(vm.value_from_str(&name))
+        });
+        let s = shared.clone();
+        engine.register_host_fn("__nodeValue", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(Value::null()) };
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else { return Ok(Value::null()) };
+            let text = {
+                let d = dom.doc_handle.lock().unwrap();
+                match &d.node(nid).kind {
+                    NodeKind::Text(t) => Some(t.clone()),
+                    _ => None,
+                }
+            };
+            drop(dom);
+            match text {
+                Some(t) => Ok(vm.value_from_str(&t)),
+                None => Ok(Value::null()),
+            }
+        });
+
         let s = shared.clone();
         engine.register_host_fn("__elemDataset", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else {
@@ -1415,6 +1568,26 @@ function _wrapElem(handle) {
         get dataset() {
             return __elemDataset(this._h);
         },
+        // ---- Node tree (covers elements + text nodes) ----
+        get firstChild() { return _wrapElem(__nodeFirstChild(this._h)); },
+        get lastChild()  { return _wrapElem(__nodeLastChild(this._h)); },
+        get nextSibling() { return _wrapElem(__nodeNextSibling(this._h)); },
+        get previousSibling() { return _wrapElem(__nodePrevSibling(this._h)); },
+        get nodeType() { return __nodeType(this._h); },
+        get nodeName() { return __nodeName(this._h); },
+        get nodeValue() { return __nodeValue(this._h); },
+        // childNodes walks first / next sibling to build a
+        // NodeList of every child (elements + text nodes), as
+        // opposed to `children` which is element-only.
+        get childNodes() {
+            var out = [];
+            var c = this.firstChild;
+            while (c !== null) {
+                out.push(c);
+                c = c.nextSibling;
+            }
+            return out;
+        },
         // style — CSSStyleDeclaration-shaped object with the
         // common surface: `setProperty(name, value)`,
         // `getPropertyValue(name)`, `removeProperty(name)`,
@@ -2007,6 +2180,47 @@ mod tests {
             url_seen.lock().unwrap().as_deref(),
             Some("/api/x"),
         );
+    }
+
+    #[test]
+    fn node_tree_walks_elements_and_text() {
+        let mut engine = Engine::new();
+        // Body has an element with a text child + a sibling
+        // element. Mixed content is the realistic shape.
+        let doc = wrapped_doc(
+            "<body><p id='p1'>hello</p><p id='p2'>world</p></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        // firstChild of <p id='p1'> is the text node.
+        let (kind, _) = engine.eval_with_output(
+            "document.querySelector('#p1').firstChild.nodeType",
+        );
+        assert_eq!(kind, "3"); // TEXT_NODE
+        let (val, _) = engine.eval_with_output(
+            "document.querySelector('#p1').firstChild.nodeValue",
+        );
+        assert_eq!(val, "hello");
+
+        // nextSibling of #p1 is the element <p id='p2'>.
+        let (sib_id, _) = engine.eval_with_output(
+            "document.querySelector('#p1').nextSibling.id",
+        );
+        assert_eq!(sib_id, "p2");
+        let (sib_type, _) = engine.eval_with_output(
+            "document.querySelector('#p1').nextSibling.nodeType",
+        );
+        assert_eq!(sib_type, "1"); // ELEMENT_NODE
+
+        // childNodes includes the text node.
+        let (count, _) = engine.eval_with_output(
+            "document.querySelector('#p1').childNodes.length",
+        );
+        assert_eq!(count, "1");
+        let (name, _) = engine.eval_with_output(
+            "document.querySelector('#p1').childNodes[0].nodeName",
+        );
+        assert_eq!(name, "#text");
     }
 
     #[test]
