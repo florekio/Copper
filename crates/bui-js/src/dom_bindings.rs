@@ -526,6 +526,33 @@ impl BindingContext {
         // round-trip to the DOM today; use `setAttribute(
         // 'data-foo', 'x')` for the write path until we have a
         // Proxy-based surface.
+        // `__elemContains(parentHandle, childHandle)` — true
+        // when `child` is `parent` or a descendant. Walks
+        // child→root via the parent chain (cheap) rather than
+        // descending parent. Mirrors `Node.contains` semantics
+        // (a node contains itself).
+        let s = shared.clone();
+        engine.register_host_fn("__elemContains", move |_vm, _this, args| {
+            let Some(parent_h) = args.first().copied() else { return Ok(Value::boolean(false)) };
+            let Some(child_h) = args.get(1).copied() else { return Ok(Value::boolean(false)) };
+            let dom = s.lock().unwrap();
+            let Some(parent_nid) = dom.node_for_handle(parent_h) else {
+                return Ok(Value::boolean(false));
+            };
+            let Some(child_nid) = dom.node_for_handle(child_h) else {
+                return Ok(Value::boolean(false));
+            };
+            let d = dom.doc_handle.lock().unwrap();
+            let mut cur = Some(child_nid);
+            while let Some(id) = cur {
+                if id == parent_nid {
+                    return Ok(Value::boolean(true));
+                }
+                cur = d.node(id).parent;
+            }
+            Ok(Value::boolean(false))
+        });
+
         // ---- Node tree (any node, not just elements) ----
         //
         // Element handles are pre-allocated at install time
@@ -1588,6 +1615,57 @@ function _wrapElem(handle) {
             }
             return out;
         },
+        // parentNode is the Node-level alias of parentElement.
+        // For DocumentFragment / Document handling they differ
+        // (parentNode can be a non-Element); for our DOM both
+        // shapes collapse to the same answer.
+        get parentNode() { return _wrapElem(__elemParent(this._h)); },
+        // ownerDocument always resolves to the global document
+        // for nodes that live in our tree. Frameworks check
+        // `el.ownerDocument === document` to verify the node
+        // hasn't been detached into a foreign realm.
+        get ownerDocument() { return document; },
+        // Node.contains — true when the argument is `this` or
+        // a descendant of `this`. Backed by a parent-chain walk
+        // on the host side.
+        contains: function(other) {
+            if (!other || other._h === undefined) return false;
+            return __elemContains(this._h, other._h);
+        },
+        // ---- Layout-geometry stubs ----
+        //
+        // Every modern UI library reads at least one of these
+        // (offsetWidth, getBoundingClientRect, etc.) and
+        // crashes if they're undefined. We return zeros until
+        // the layout-lookup integration in a follow-up wires
+        // them to the real per-frame layout tree. Functions
+        // are no-ops so scripts that *call* them (not read
+        // values) survive too.
+        get offsetWidth()  { return 0; },
+        get offsetHeight() { return 0; },
+        get offsetTop()    { return 0; },
+        get offsetLeft()   { return 0; },
+        get clientWidth()  { return 0; },
+        get clientHeight() { return 0; },
+        get clientTop()    { return 0; },
+        get clientLeft()   { return 0; },
+        get scrollWidth()  { return 0; },
+        get scrollHeight() { return 0; },
+        get scrollTop()    { return 0; },
+        get scrollLeft()   { return 0; },
+        getBoundingClientRect: function() {
+            return {
+                x: 0, y: 0, width: 0, height: 0,
+                top: 0, right: 0, bottom: 0, left: 0
+            };
+        },
+        getClientRects: function() { return []; },
+        focus: __noop,
+        blur: __noop,
+        click: __noop,
+        scrollIntoView: __noop,
+        scrollTo: __noop,
+        scrollBy: __noop,
         // style — CSSStyleDeclaration-shaped object with the
         // common surface: `setProperty(name, value)`,
         // `getPropertyValue(name)`, `removeProperty(name)`,
@@ -1639,7 +1717,18 @@ var document = {
     },
     createTextNode: function(text) {
         return _wrapElem(__docCreateTextNode(text));
-    }
+    },
+    // Stubs that pages commonly read. `activeElement === null`
+    // is the standard "nothing focused" value real browsers
+    // return on a fresh page.
+    activeElement: null,
+    hidden: false,
+    visibilityState: 'visible',
+    readyState: 'complete',
+    title: '',
+    URL: '',
+    referrer: '',
+    cookie: ''
 };
 function __noop() {}
 // setTimeout shim. We don't have a real timer queue; the common
@@ -1756,7 +1845,42 @@ var window = {
     addEventListener: __ael,
     removeEventListener: __noop,
     innerWidth: 1400,
-    innerHeight: 900
+    innerHeight: 900,
+    // Scroll position is exposed both as deprecated camelCase
+    // (pageXOffset / pageYOffset) and modern (scrollX / scrollY).
+    // We return 0 — the layout-aware integration that ties these
+    // to the chrome's scroll_y is a follow-up; for now scripts
+    // that read them just see "viewport is at the top".
+    scrollX: 0,
+    scrollY: 0,
+    pageXOffset: 0,
+    pageYOffset: 0,
+    scrollTo: __noop,
+    scrollBy: __noop,
+    // Common no-op stubs that prevent crashes when scripts
+    // probe them without checking existence first.
+    getComputedStyle: function(_el) {
+        return {
+            getPropertyValue: function(_n) { return ''; }
+        };
+    },
+    matchMedia: function(_q) {
+        // Returns a MediaQueryList shape that always reports
+        // "no match" — closest honest answer without a real
+        // media-query engine.
+        return {
+            matches: false,
+            media: _q == null ? '' : String(_q),
+            addEventListener: __noop,
+            removeEventListener: __noop,
+            addListener: __noop,
+            removeListener: __noop
+        };
+    },
+    alert: __noop,
+    confirm: function() { return false; },
+    prompt: function() { return null; },
+    getSelection: function() { return null; }
 };
 // `performance` is referenced by every modern page for `now()`
 // timing marks. We back it with `Date.now()` (a real Zinc
@@ -2180,6 +2304,63 @@ mod tests {
             url_seen.lock().unwrap().as_deref(),
             Some("/api/x"),
         );
+    }
+
+    #[test]
+    fn element_contains_walks_descendants() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc(
+            "<body><div id='outer'><span id='inner'>x</span></div>\
+             <p id='sibling'>y</p></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        // outer contains itself.
+        let (self_, _) = engine.eval_with_output(
+            "(function(){ var d = document.querySelector('#outer'); return d.contains(d); })()",
+        );
+        assert_eq!(self_, "true");
+
+        // outer contains its descendant inner.
+        let (desc, _) = engine.eval_with_output(
+            "document.querySelector('#outer').contains(document.querySelector('#inner'))",
+        );
+        assert_eq!(desc, "true");
+
+        // outer does NOT contain its sibling.
+        let (sibling, _) = engine.eval_with_output(
+            "document.querySelector('#outer').contains(document.querySelector('#sibling'))",
+        );
+        assert_eq!(sibling, "false");
+    }
+
+    #[test]
+    fn layout_geometry_stubs_return_zero_without_crashing() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body><div id='d'>x</div></body>");
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        let (w, _) = engine.eval_with_output(
+            "document.querySelector('#d').offsetWidth",
+        );
+        assert_eq!(w, "0");
+
+        let (rect, _) = engine.eval_with_output(
+            "(function(){\
+                 var r = document.querySelector('#d').getBoundingClientRect();\
+                 return r.x + ',' + r.y + ',' + r.width + ',' + r.height;\
+             })()",
+        );
+        assert_eq!(rect, "0,0,0,0");
+
+        // Function stubs are callable, no return value to check.
+        engine
+            .eval("document.querySelector('#d').focus(); document.querySelector('#d').click()")
+            .expect("eval");
+
+        // window scroll position stubs.
+        let (sx, _) = engine.eval_with_output("window.scrollX + ',' + window.pageYOffset");
+        assert_eq!(sx, "0,0");
     }
 
     #[test]
