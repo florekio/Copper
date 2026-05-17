@@ -1306,6 +1306,15 @@ impl TabState {
                 console_log.push(line.clone());
             }
         }
+        // The synthetic `load` event fires inside install_and_run;
+        // anything its handlers logged or threw lands in the
+        // context's post-load buffer. Drain it now so the
+        // dev-dock Console reflects everything that ran during
+        // page bootstrap, not just the inline-script pass.
+        for line in js_ctx.take_console_lines() {
+            eprintln!("[js] {line}");
+            console_log.push(line);
+        }
         // If a script set `window.location.href`, resolve it against
         // the current URL and follow the redirect by recursing once
         // into `TabState::fetch`. One-shot: the recursion's own
@@ -1493,6 +1502,14 @@ impl TabState {
             return DispatchOutcome::default();
         };
         let event = ctx.dispatch(bui_js::Event::new(kind, target));
+        // Drain any console output the handler produced (real
+        // console.log lines + any uncaught exceptions
+        // dispatch_inner surfaced) into TabState.console_log
+        // so the dev-dock Console picks them up.
+        for line in ctx.take_console_lines() {
+            eprintln!("[js] {line}");
+            self.console_log.push(line);
+        }
         let pending = ctx.take_pending_navigation();
         // We don't act on the dirty flag here — the orchestrator
         // calls layout on every frame anyway, and the dispatch

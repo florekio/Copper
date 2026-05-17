@@ -264,11 +264,21 @@ impl EventListenerMap {
                 Listener::Js(callable) => {
                     if let Some(vm_ref) = vm.as_deref_mut() {
                         let event_obj = build_js_event(vm_ref, event, ctx);
-                        // Swallow JS exceptions for now — exposing
-                        // them via the dev-dock Console is a tiny
-                        // follow-up that threads an output sink
-                        // through here.
-                        let _ = vm_ref.host_call(*callable, &[event_obj]);
+                        if vm_ref.host_call(*callable, &[event_obj]).is_err() {
+                            // Surface uncaught exceptions to the
+                            // embedder's console drain via the
+                            // VM's `output` buffer. We don't have
+                            // public Vm access to resolve the
+                            // error Value's `.message` into a
+                            // string here (the interner is
+                            // crate-private); a generic label is
+                            // honest about that limit and still
+                            // strictly better than the silent
+                            // swallow we had before.
+                            vm_ref
+                                .output
+                                .push(format!("Uncaught exception in '{}' handler", event.kind));
+                        }
                     }
                 }
             }

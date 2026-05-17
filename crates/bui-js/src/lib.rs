@@ -124,6 +124,12 @@ pub struct JsContext {
     /// against. The embedder hands the same Arc into this struct
     /// AND keeps a clone on `TabState`; both see the same DOM.
     doc: Arc<Mutex<Document>>,
+    /// Length of `engine.vm().output` immediately after the
+    /// last `take_console_lines()` drain. Subsequent calls
+    /// return only the lines appended since — console.log
+    /// messages and `Uncaught exception …` lines pushed by
+    /// `dispatch_inner` both land here.
+    output_cursor: usize,
 }
 
 impl JsContext {
@@ -152,6 +158,13 @@ impl JsContext {
         // infinite loop in under a second. Without this the
         // browser thread blocks forever on bad JS.
         engine.set_max_steps(50_000_000);
+        // Silence Zinc's default stdout / stderr writes for
+        // `console.log / warn / error`. The embedder is the
+        // single source of truth for routing those lines into
+        // the dev-dock Console (via `take_console_lines`); the
+        // VM still captures every output line into its internal
+        // `output` buffer regardless.
+        engine.set_silent_console(true);
         let bindings = BindingContext::install_with_fetcher(
             &mut engine,
             doc.clone(),
@@ -173,10 +186,17 @@ impl JsContext {
             });
         }
 
+        // Capture the post-eval output cursor so the load-event
+        // dispatch below — and every subsequent dispatch — only
+        // surfaces lines pushed during *that* dispatch, not the
+        // initial script-pass output (which is already returned
+        // via `outcomes`).
+        let cursor = engine.vm().output.len();
         let mut ctx = JsContext {
             engine,
             bindings,
             doc,
+            output_cursor: cursor,
         };
         // Synthetic `load` event so handlers registered via
         // `window.addEventListener('load', …)` get one fan-out
@@ -230,6 +250,25 @@ impl JsContext {
     /// frames.
     pub fn drain_microtasks(&mut self) {
         let _ = self.engine.vm().drain_microtasks();
+    }
+
+    /// Return — and consume — every console line the VM has
+    /// pushed since the previous drain. Includes:
+    /// - `console.log` / `console.warn` / `console.error` lines
+    ///   the engine captured during the last dispatch.
+    /// - `Uncaught exception in '<kind>' handler` lines pushed
+    ///   by `dispatch_inner` when a JS listener throws.
+    ///
+    /// The embedder routes these into the dev-dock Console.
+    /// Returns an empty Vec when nothing new appeared.
+    pub fn take_console_lines(&mut self) -> Vec<String> {
+        let buf = &self.engine.vm().output;
+        if buf.len() <= self.output_cursor {
+            return Vec::new();
+        }
+        let new_lines = buf[self.output_cursor..].to_vec();
+        self.output_cursor = buf.len();
+        new_lines
     }
 
     /// Drain the URL JS asked us to navigate to. Returns `None`
@@ -481,6 +520,77 @@ mod tests {
         // And we observe the side-effect of the handler running.
         let (fired, _) = ctx.engine.eval_with_output("fired");
         assert_eq!(fired, "1");
+    }
+
+    /// Event-handler runtime exceptions are routed into the
+    /// per-context console buffer (was: silently swallowed).
+    /// The dev-dock Console picks these lines up via
+    /// `take_console_lines` on every dispatch — the embedder no
+    /// longer flies blind when a handler throws.
+    #[test]
+    fn uncaught_event_handler_exception_lands_in_console_buffer() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let form = d.create_element("form");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "document.addEventListener('submit', function(){\n\
+                 throw new Error('boom');\n\
+             });",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, form);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        // Drain anything from the load event so the next drain
+        // is just our submit listener.
+        let _ = ctx.take_console_lines();
+
+        let _ = ctx.dispatch(Event::new("submit", form));
+        let lines = ctx.take_console_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Uncaught exception") && l.contains("submit")),
+            "expected Uncaught-exception line in {lines:?}",
+        );
+    }
+
+    /// console.log calls inside an event handler land in
+    /// `take_console_lines()` so the dev-dock Console renders
+    /// them in real time. Was: lost in vm.output, never read.
+    #[test]
+    fn handler_console_log_lands_in_console_buffer() {
+        let mut d = Document::new();
+        let html = d.create_element("html");
+        let body = d.create_element("body");
+        let form = d.create_element("form");
+        let script = d.create_element("script");
+        let src = d.create_text(
+            "document.addEventListener('submit', function(){\n\
+                 console.log('handler ran');\n\
+             });",
+        );
+        d.append_child(d.root, html);
+        d.append_child(html, body);
+        d.append_child(body, form);
+        d.append_child(html, script);
+        d.append_child(script, src);
+
+        let doc = Arc::new(Mutex::new(d));
+        let (mut ctx, _outcomes) =
+            JsContext::install_and_run(doc.clone(), "https://example.com/".into(), None);
+        let _ = ctx.take_console_lines();
+
+        let _ = ctx.dispatch(Event::new("submit", form));
+        let lines = ctx.take_console_lines();
+        assert_eq!(lines, vec!["handler ran".to_string()]);
     }
 
     /// Phase 7: Promise.then callbacks inside an event handler
