@@ -22,6 +22,69 @@ deadline. Each phase has high variance because the bundle
 is highly inter-dependent — one missing API on the critical
 path can block the next ten.
 
+## Where `/search` differs from `/` (homepage)
+
+After several rounds of Phase 19 work, the homepage
+`google.com` renders real content (top bar, logo SVG, footer
+links). The search-results page `google.com/search?q=…` still
+renders empty. The difference is structural:
+
+| Aspect | `/` (homepage) | `/search?q=…` |
+|---|---|---|
+| Response size | ~150 KB | ~90 KB |
+| `<script src=…>` tags | 1 (the xjs bundle) | 0 |
+| `<form>` / `<input>` in HTML | Yes | No |
+| Visible `<body>` content | Logo + footer in static HTML | None — body is empty |
+| Inline scripts | ~5 small + xjs handler | 5, the big one is a 62 KB self-decoding bundle |
+| Render strategy | Static HTML, JS for enhancement | 100 % JS-injected from a self-eval'd bundle |
+
+The 62 KB inline script #2 on `/search` is a **self-decoding
+bundle**. It defines a state-machine dispatcher
+
+```js
+z = function(c, L, Z, T, F, H, S, W, C, n) {
+    for (C=64; C!=60;)
+        if (C==64) C = c;
+        else if (C==65) { /* TrustedTypes branch */ }
+        else if (C==37) return n;
+        else { /* numbered-state transitions */ }
+};
+```
+
+…walks through a numbered-state interpreter loop, assembles
+the bundle's real source by joining an array of fragments,
+then passes the result through `(0, eval)(...)`.
+
+The eval'd code references unbound minified names (`J`, `K`,
+…) that the dispatcher was supposed to populate. When the
+state walk doesn't reach the terminal `C==37` branch with
+the expected `n` payload (because something in our engine
+doesn't match what Google's runtime would do), the eval'd
+script references `J` as a free variable and throws
+`ReferenceError: J is not defined` on the first access.
+
+Tried (didn't work): pre-declaring `var J, K, M, …`
+globally as `undefined` in the prelude. The dispatcher
+writes through to those names via a pattern that conflicts
+with the already-declared `var` — crashed `/search`
+entirely and added new errors on `/`.
+
+To make `/search` render specifically:
+
+1. **Reverse-engineer** the state-machine dispatcher enough
+   to know what API surface it expects in the global scope
+   for the walk to complete. The dispatcher uses `x =
+   this || self` and reads `x.trustedTypes` plus a few other
+   globals; stubbing those right *might* unlock the rest.
+2. **Vendor closure-library** so Google's bundle never has
+   to fall back to the self-decode path — Phase 19 proper.
+
+Both are real, neither is session-sized. The chase-
+individual-error loop that worked for the homepage doesn't
+help here because the actual error happens in
+dynamically-generated code that doesn't exist on disk for us
+to read or patch.
+
 ## Today's reality (May 2026)
 
 Inline scripts run. DOM mutations work. Submit events fire
