@@ -91,6 +91,67 @@ impl DomShared {
     }
 }
 
+/// Convert a CSS / HTML kebab-case identifier (`font-size`,
+/// `data-foo-bar`) to JS camelCase (`fontSize`, `fooBar`).
+/// Each `-x` becomes `X`. Used by the `dataset` getter to
+/// match the HTMLElement.dataset spec.
+fn kebab_to_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut upper_next = false;
+    for c in s.chars() {
+        if c == '-' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Parse an inline `style="…"` attribute into ordered
+/// (property, value) pairs. Tolerant: missing trailing
+/// semicolons are fine; malformed pairs are skipped; values
+/// preserve their author casing. Property names are lowercased
+/// for matching but the original spelling is dropped — round-
+/// tripping through `setStyle` always emits canonical kebab-
+/// case lowercase, matching what every browser does.
+fn parse_inline_style(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in text.split(';') {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let Some(colon) = s.find(':') else { continue };
+        let prop = s[..colon].trim().to_ascii_lowercase();
+        let value = s[colon + 1..].trim().to_string();
+        if prop.is_empty() {
+            continue;
+        }
+        out.push((prop, value));
+    }
+    out
+}
+
+/// Round-trip the inline-style declarations back to attribute
+/// form. Emits `prop: value; prop: value` with a trailing
+/// semicolon dropped — Chrome's `cssText` formatting.
+fn serialise_inline_style(decls: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (i, (p, v)) in decls.iter().enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        out.push_str(p);
+        out.push_str(": ");
+        out.push_str(v);
+    }
+    out
+}
+
 /// One captured HTTP fetch — what the embedder hands to bui-js
 /// when an inline script calls `fetch(url)`. Status `0` signals
 /// the request failed before producing a real response (DNS,
@@ -428,6 +489,179 @@ impl BindingContext {
                 Some(v) => Ok(vm.value_from_str(v)),
                 None => Ok(Value::null()),
             }
+        });
+
+        // `__elemDataset(handle)` returns a plain JS object built
+        // from every `data-*` attribute on the element, with the
+        // kebab-case name converted to camelCase per the
+        // HTMLElement.dataset spec (`data-foo-bar` → `fooBar`).
+        // Reading only — the prelude exposes `el.dataset` as a
+        // getter that calls this each time, so the snapshot
+        // always reflects the current DOM. Writing back through
+        // the dataset object (`el.dataset.foo = 'x'`) doesn't
+        // round-trip to the DOM today; use `setAttribute(
+        // 'data-foo', 'x')` for the write path until we have a
+        // Proxy-based surface.
+        let s = shared.clone();
+        engine.register_host_fn("__elemDataset", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(vm.alloc_object());
+            };
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else {
+                return Ok(vm.alloc_object());
+            };
+            // Collect (camelCase, value) pairs while the lock
+            // is held; the heap allocations / interner writes
+            // happen afterward.
+            let mut entries: Vec<(String, String)> = Vec::new();
+            {
+                let d = dom.doc_handle.lock().unwrap();
+                let Some(elem) = d.element(nid) else {
+                    return Ok(vm.alloc_object());
+                };
+                for (name, value) in &elem.attrs {
+                    let Some(rest) = name.strip_prefix("data-") else { continue };
+                    entries.push((kebab_to_camel(rest), value.to_string()));
+                }
+            }
+            drop(dom);
+            let obj = vm.alloc_object();
+            for (k, v) in &entries {
+                let s = vm.value_from_str(v);
+                vm.set_property(obj, k, s);
+            }
+            Ok(obj)
+        });
+
+        // `__elemGetStyle(handle, prop)` reads a single CSS
+        // property from the element's inline `style="…"`
+        // attribute. Property names match the CSS form
+        // (kebab-case: `background-color`, `font-size`).
+        // Returns an empty string when the property isn't set
+        // — matches the spec's
+        // `CSSStyleDeclaration.getPropertyValue` return shape.
+        let s = shared.clone();
+        engine.register_host_fn("__elemGetStyle", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(vm.value_from_str(""));
+            };
+            let Some(prop) = read_str(vm, args.get(1)) else {
+                return Ok(vm.value_from_str(""));
+            };
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else {
+                return Ok(vm.value_from_str(""));
+            };
+            let inline = dom
+                .doc_handle
+                .lock()
+                .unwrap()
+                .element(nid)
+                .and_then(|e| e.get_attr("style").map(|s| s.to_string()))
+                .unwrap_or_default();
+            drop(dom);
+            let value = parse_inline_style(&inline)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&prop))
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            Ok(vm.value_from_str(&value))
+        });
+
+        // `__elemSetStyle(handle, prop, value)` writes a single
+        // CSS property into the inline style attribute. An
+        // empty `value` removes the property. The full attr is
+        // re-serialised after each write so subsequent reads
+        // see the canonical "prop: value; prop: value" form.
+        let s = shared.clone();
+        engine.register_host_fn("__elemSetStyle", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(Value::null());
+            };
+            let Some(prop) = read_str(vm, args.get(1)) else {
+                return Ok(Value::null());
+            };
+            let value = read_str(vm, args.get(2)).unwrap_or_default();
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else {
+                return Ok(Value::null());
+            };
+            let changed;
+            {
+                let mut d = dom.doc_handle.lock().unwrap();
+                let inline = d
+                    .element(nid)
+                    .and_then(|e| e.get_attr("style").map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let mut decls = parse_inline_style(&inline);
+                decls.retain(|(k, _)| !k.eq_ignore_ascii_case(&prop));
+                if !value.is_empty() {
+                    decls.push((prop.clone(), value.clone()));
+                }
+                let serialised = serialise_inline_style(&decls);
+                let prev = d
+                    .element(nid)
+                    .and_then(|e| e.get_attr("style").map(|s| s.to_string()));
+                changed = prev.as_deref() != Some(serialised.as_str());
+                if let Some(elem) = d.element_mut(nid) {
+                    if serialised.is_empty() {
+                        elem.remove_attr("style");
+                    } else {
+                        elem.set_attr("style", &serialised);
+                    }
+                }
+            }
+            if changed {
+                dom.mark_dirty();
+            }
+            Ok(Value::null())
+        });
+
+        // `__elemGetStyleText(handle)` and `__elemSetStyleText`
+        // are the `cssText` shorthand: read or replace the
+        // entire inline style attribute as one string. Setting
+        // an empty cssText removes the attribute.
+        let s = shared.clone();
+        engine.register_host_fn("__elemGetStyleText", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(vm.value_from_str(""));
+            };
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else {
+                return Ok(vm.value_from_str(""));
+            };
+            let text = dom
+                .doc_handle
+                .lock()
+                .unwrap()
+                .element(nid)
+                .and_then(|e| e.get_attr("style").map(|s| s.to_string()))
+                .unwrap_or_default();
+            Ok(vm.value_from_str(&text))
+        });
+        let s = shared.clone();
+        engine.register_host_fn("__elemSetStyleText", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else {
+                return Ok(Value::null());
+            };
+            let text = read_str(vm, args.get(1)).unwrap_or_default();
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else {
+                return Ok(Value::null());
+            };
+            {
+                let mut d = dom.doc_handle.lock().unwrap();
+                if let Some(elem) = d.element_mut(nid) {
+                    if text.trim().is_empty() {
+                        elem.remove_attr("style");
+                    } else {
+                        elem.set_attr("style", &text);
+                    }
+                }
+            }
+            dom.mark_dirty();
+            Ok(Value::null())
         });
 
         // `__formElements(formHandle)` returns a JS object whose
@@ -1170,6 +1404,44 @@ function _wrapElem(handle) {
                 out[k] = _wrapElem(raw[k]);
             }
             return out;
+        },
+        // dataset — every `data-foo` attribute surfaces as
+        // `el.dataset.foo`, kebab-case names converted to
+        // camelCase (`data-foo-bar` → `dataset.fooBar`).
+        // Read-only today: assignment to `el.dataset.X = …`
+        // updates the returned snapshot only. Use
+        // `setAttribute('data-X', …)` for the write path
+        // until we have a Proxy-backed surface.
+        get dataset() {
+            return __elemDataset(this._h);
+        },
+        // style — CSSStyleDeclaration-shaped object with the
+        // common surface: `setProperty(name, value)`,
+        // `getPropertyValue(name)`, `removeProperty(name)`,
+        // plus `cssText` get/set for whole-attribute reads /
+        // writes. The camelCase-property surface
+        // (`style.fontSize = …`) isn't here yet — that needs
+        // a Proxy to forward arbitrary property accesses
+        // through to setProperty. Most JS that mutates inline
+        // styles uses `setProperty` / `cssText` directly.
+        get style() {
+            var h = this._h;
+            return {
+                _h: h,
+                get cssText() { return __elemGetStyleText(h); },
+                set cssText(v) { __elemSetStyleText(h, v == null ? '' : String(v)); },
+                getPropertyValue: function(name) {
+                    return __elemGetStyle(h, String(name));
+                },
+                setProperty: function(name, value) {
+                    __elemSetStyle(h, String(name), value == null ? '' : String(value));
+                },
+                removeProperty: function(name) {
+                    var prev = __elemGetStyle(h, String(name));
+                    __elemSetStyle(h, String(name), '');
+                    return prev;
+                }
+            };
         }
     };
 }
@@ -1735,6 +2007,110 @@ mod tests {
             url_seen.lock().unwrap().as_deref(),
             Some("/api/x"),
         );
+    }
+
+    #[test]
+    fn dataset_exposes_data_attrs_as_camelcase() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc(
+            "<body><div id='d' data-foo='one' data-foo-bar='two' \
+             data-x='three' class='ignored' title='also-ignored'></div></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        // `data-foo` → `dataset.foo`.
+        let (foo, _) = engine.eval_with_output(
+            "document.querySelector('#d').dataset.foo",
+        );
+        assert_eq!(foo, "one");
+
+        // `data-foo-bar` → `dataset.fooBar` (kebab → camel).
+        let (foobar, _) = engine.eval_with_output(
+            "document.querySelector('#d').dataset.fooBar",
+        );
+        assert_eq!(foobar, "two");
+
+        // Non-`data-` attributes are not surfaced.
+        let (title, _) = engine.eval_with_output(
+            "document.querySelector('#d').dataset.title",
+        );
+        // Zinc's stringify of `undefined` is the literal word.
+        assert_eq!(title, "undefined");
+    }
+
+    #[test]
+    fn style_set_get_remove_property_round_trips_through_style_attr() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc(
+            "<body><div id='d' style='color: red'></div></body>",
+        );
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        // Initial value.
+        let (color, _) = engine.eval_with_output(
+            "document.querySelector('#d').style.getPropertyValue('color')",
+        );
+        assert_eq!(color, "red");
+
+        // Set a new property.
+        engine
+            .eval(
+                "document.querySelector('#d').style.setProperty('font-size', '16px')",
+            )
+            .expect("eval");
+        let (fs, _) = engine.eval_with_output(
+            "document.querySelector('#d').style.getPropertyValue('font-size')",
+        );
+        assert_eq!(fs, "16px");
+
+        // Remove the original.
+        engine
+            .eval("document.querySelector('#d').style.removeProperty('color')")
+            .expect("eval");
+        let (gone, _) = engine.eval_with_output(
+            "document.querySelector('#d').style.getPropertyValue('color')",
+        );
+        assert_eq!(gone, "");
+
+        // Verify the DOM round-trip — the new attr is the
+        // canonical "prop: value" serialisation.
+        let d = doc.lock().unwrap();
+        let div = d
+            .descendants(d.root)
+            .find(|n| d.element(*n).map(|e| e.name == "div").unwrap_or(false))
+            .expect("div");
+        assert_eq!(
+            d.element(div).and_then(|e| e.get_attr("style")),
+            Some("font-size: 16px"),
+        );
+    }
+
+    #[test]
+    fn style_csstext_replaces_whole_attribute() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body><div id='d'></div></body>");
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+
+        engine
+            .eval(
+                "document.querySelector('#d').style.cssText = 'display: none; opacity: 0.5'",
+            )
+            .expect("eval");
+        let (got, _) = engine.eval_with_output(
+            "document.querySelector('#d').style.cssText",
+        );
+        assert_eq!(got, "display: none; opacity: 0.5");
+
+        // Assigning empty cssText drops the attribute.
+        engine
+            .eval("document.querySelector('#d').style.cssText = ''")
+            .expect("eval");
+        let d = doc.lock().unwrap();
+        let div = d
+            .descendants(d.root)
+            .find(|n| d.element(*n).map(|e| e.name == "div").unwrap_or(false))
+            .expect("div");
+        assert_eq!(d.element(div).and_then(|e| e.get_attr("style")), None);
     }
 
     #[test]
