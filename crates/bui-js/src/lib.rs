@@ -189,18 +189,20 @@ impl JsContext {
             // actual rendering code (Google's xjs, React's
             // app.js, every CDN'd bundle).
             //
-            // Size cap. Two failure modes for huge bundles:
-            // 256 KB+ runs Zinc into its 50 M `max_steps`
-            // budget and the eval slowly resolves to an error
-            // outcome (fine). 1 MB+ trips a Zinc crash —
-            // SIGTRAP (exit 133), most likely a stack
-            // overflow in the parser or VM frame setup on
-            // the giant compiled output. Until Zinc fixes
-            // that path, capping at 256 KB keeps the browser
-            // alive on Google-shaped pages. Smaller React /
-            // Vue / Svelte bundles fit and run to
-            // completion.
-            const EXTERNAL_SCRIPT_CAP: usize = 256 * 1024;
+            // Size cap. Earlier debugging showed the SIGTRAP
+            // we saw with 1 MB+ bundles was actually caused
+            // by our own closure-IIFE shim — feeding the
+            // xjs bundle through `closure_shim::maybe_inject`
+            // let execution proceed deep enough into the
+            // bundle to overflow Zinc's call stack. With the
+            // shim now gated at 64 KB (small inline IIFEs
+            // only), large external bundles run unshimmed
+            // and hit a clean RuntimeError on the first `_.X`
+            // access instead of SIGTRAPping. Capping at 2 MB
+            // gives us headroom for Google's xjs (1 MB) +
+            // gstatic's og.asy (264 KB) + most React/Vue/
+            // Svelte CDN bundles.
+            const EXTERNAL_SCRIPT_CAP: usize = 2 * 1024 * 1024;
             let source: String = match source {
                 ScriptSource::Inline(s) => s,
                 ScriptSource::External(url) => {
@@ -247,7 +249,23 @@ impl JsContext {
             // a multi-week vendoring task — but defusing the
             // error cascade is real progress toward the
             // eventual proper fix.
-            let rewritten = closure_shim::maybe_inject(&source);
+            //
+            // Cap the shim at 64 KB. The xjs bundle (1 MB+)
+            // also matches the IIFE pattern but feeding it
+            // through the shim lets execution go deeper into
+            // the bundle, where Zinc's call stack overflows
+            // and SIGTRAPs the browser. The shim's actual
+            // value is on the small gbar/inline IIFEs that
+            // are well under 64 KB; gating by size keeps
+            // those working while letting large external
+            // bundles run unshimmed (they hit a clean
+            // RuntimeError on the first `_.X` access, the
+            // browser stays alive).
+            let rewritten = if source.len() <= 64 * 1024 {
+                closure_shim::maybe_inject(&source)
+            } else {
+                source.clone()
+            };
             let (result, mut output) = engine.eval_with_output(&rewritten);
             if is_script_error(&result) {
                 // Capture a source preview so the dev-dock
