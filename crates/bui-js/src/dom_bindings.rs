@@ -2383,6 +2383,16 @@ function _wrapElem(handle) {
             }, capture === true);
         },
         removeEventListener: __noop,
+        // dispatchEvent — when called from JS, fire the event
+        // through our internal listener map. Currently a stub
+        // that returns `!event.defaultPrevented` so feature-
+        // probe code gets a truthy answer; real cross-target
+        // dispatch needs re-entrant listener-map access which
+        // is the explicit follow-up.
+        dispatchEvent: function(event) {
+            if (event && event.defaultPrevented) return false;
+            return true;
+        },
         // Form-control value. For <input> reads the `value`
         // attribute. For <textarea> reads the text content.
         // Setter writes back through `setAttribute`. Doesn't
@@ -2884,6 +2894,252 @@ function structuredClone(value) {
     catch (e) { return value; }
 }
 
+// AbortController + AbortSignal polyfills. Modern fetch /
+// fetch-like code passes `{ signal: controller.signal }` and
+// expects `controller.abort()` to cancel. The signal carries
+// `aborted` / `reason` and supports `addEventListener('abort',
+// cb)`. Without these the typical "race + cancel slow path"
+// idiom crashes on missing-class throws.
+function AbortController() {
+    var listeners = [];
+    var signal = {
+        aborted: false,
+        reason: undefined,
+        addEventListener: function(type, cb) {
+            if (type === 'abort' && typeof cb === 'function') {
+                listeners.push(cb);
+            }
+        },
+        removeEventListener: function(type, cb) {
+            if (type !== 'abort') return;
+            var kept = [];
+            for (var i = 0; i < listeners.length; i++) {
+                if (listeners[i] !== cb) kept.push(listeners[i]);
+            }
+            listeners.length = 0;
+            for (var i = 0; i < kept.length; i++) listeners.push(kept[i]);
+        },
+        throwIfAborted: function() {
+            if (signal.aborted) throw signal.reason;
+        },
+        dispatchEvent: function(_e) { return true; },
+        onabort: null
+    };
+    this.signal = signal;
+    this.abort = function(reason) {
+        if (signal.aborted) return;
+        signal.aborted = true;
+        signal.reason = (reason === undefined)
+            ? new Error('AbortError: signal is aborted without reason')
+            : reason;
+        if (typeof signal.onabort === 'function') {
+            try { signal.onabort({ type: 'abort' }); } catch (e) {}
+        }
+        for (var i = 0; i < listeners.length; i++) {
+            try { listeners[i].call(signal, { type: 'abort' }); } catch (e) {}
+        }
+    };
+}
+// `AbortSignal.abort(reason)` and `AbortSignal.timeout(ms)`
+// are widely-used static factories. The timeout variant
+// schedules a real setTimeout via our timer queue.
+var AbortSignal = {
+    abort: function(reason) {
+        var c = new AbortController();
+        c.abort(reason);
+        return c.signal;
+    },
+    timeout: function(ms) {
+        var c = new AbortController();
+        setTimeout(function() { c.abort(new Error('TimeoutError')); }, ms);
+        return c.signal;
+    },
+    any: function(signals) {
+        var c = new AbortController();
+        for (var i = 0; i < signals.length; i++) {
+            if (signals[i].aborted) { c.abort(signals[i].reason); return c.signal; }
+            signals[i].addEventListener('abort', function() {
+                c.abort(this.reason);
+            });
+        }
+        return c.signal;
+    }
+};
+
+// FormData polyfill. Used by every form-submitting page +
+// every fetch-based file upload. Stores name/value entries
+// in insertion order; values can be strings or blob-like.
+function FormData(_form) {
+    var entries = [];
+    // Constructing from a <form> element: walk the form's
+    // controls and seed entries from name/value. The
+    // wrapper element's `elements` accessor (when present)
+    // gives us a name→control map; we iterate the keys.
+    if (_form && _form.elements) {
+        var els = _form.elements;
+        for (var name in els) {
+            var el = els[name];
+            if (el && typeof el.value !== 'undefined') {
+                entries.push([name, String(el.value)]);
+            }
+        }
+    }
+    this.append = function(name, value) {
+        entries.push([String(name), value]);
+    };
+    this.set = function(name, value) {
+        name = String(name);
+        var found = false;
+        var kept = [];
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) {
+                if (!found) { kept.push([name, value]); found = true; }
+            } else {
+                kept.push(entries[i]);
+            }
+        }
+        if (!found) kept.push([name, value]);
+        entries.length = 0;
+        for (var i = 0; i < kept.length; i++) entries.push(kept[i]);
+    };
+    this.get = function(name) {
+        name = String(name);
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) return entries[i][1];
+        }
+        return null;
+    };
+    this.getAll = function(name) {
+        name = String(name);
+        var out = [];
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) out.push(entries[i][1]);
+        }
+        return out;
+    };
+    this.has = function(name) {
+        name = String(name);
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] === name) return true;
+        }
+        return false;
+    };
+    this.delete = function(name) {
+        name = String(name);
+        var kept = [];
+        for (var i = 0; i < entries.length; i++) {
+            if (entries[i][0] !== name) kept.push(entries[i]);
+        }
+        entries.length = 0;
+        for (var i = 0; i < kept.length; i++) entries.push(kept[i]);
+    };
+    this.forEach = function(cb, thisArg) {
+        for (var i = 0; i < entries.length; i++) {
+            cb.call(thisArg, entries[i][1], entries[i][0], this);
+        }
+    };
+}
+
+// Headers polyfill. Used by fetch() Request/Response shapes.
+// Names are case-insensitive (lowercased internally), values
+// stringified. Multi-value `append` matches spec; `set`
+// replaces existing values with the same name.
+function Headers(init) {
+    var pairs = [];
+    if (init !== undefined && init !== null) {
+        if (Array.isArray(init)) {
+            for (var i = 0; i < init.length; i++) {
+                pairs.push([String(init[i][0]).toLowerCase(), String(init[i][1])]);
+            }
+        } else if (typeof init === 'object') {
+            for (var k in init) {
+                pairs.push([k.toLowerCase(), String(init[k])]);
+            }
+        }
+    }
+    this.get = function(name) {
+        name = String(name).toLowerCase();
+        for (var i = 0; i < pairs.length; i++) {
+            if (pairs[i][0] === name) return pairs[i][1];
+        }
+        return null;
+    };
+    this.set = function(name, value) {
+        name = String(name).toLowerCase();
+        value = String(value);
+        var found = false;
+        var kept = [];
+        for (var i = 0; i < pairs.length; i++) {
+            if (pairs[i][0] === name) {
+                if (!found) { kept.push([name, value]); found = true; }
+            } else {
+                kept.push(pairs[i]);
+            }
+        }
+        if (!found) kept.push([name, value]);
+        pairs.length = 0;
+        for (var i = 0; i < kept.length; i++) pairs.push(kept[i]);
+    };
+    this.has = function(name) {
+        name = String(name).toLowerCase();
+        for (var i = 0; i < pairs.length; i++) {
+            if (pairs[i][0] === name) return true;
+        }
+        return false;
+    };
+    this.append = function(name, value) {
+        pairs.push([String(name).toLowerCase(), String(value)]);
+    };
+    this.delete = function(name) {
+        name = String(name).toLowerCase();
+        var kept = [];
+        for (var i = 0; i < pairs.length; i++) {
+            if (pairs[i][0] !== name) kept.push(pairs[i]);
+        }
+        pairs.length = 0;
+        for (var i = 0; i < kept.length; i++) pairs.push(kept[i]);
+    };
+    this.forEach = function(cb, thisArg) {
+        for (var i = 0; i < pairs.length; i++) {
+            cb.call(thisArg, pairs[i][1], pairs[i][0], this);
+        }
+    };
+}
+
+// `Event(type, init)` and `CustomEvent(type, init)` JS-side
+// constructors. The Event object that flows through our
+// internal `dispatch_js` is built by Rust; these are the
+// constructors user code calls when it wants to make its own
+// events (for `target.dispatchEvent(new CustomEvent(...))`).
+// dispatch through our listener map is a follow-up — for now
+// the constructor returns a plain object so feature-probe
+// code (`typeof CustomEvent === 'function'`) and the
+// `new Event(...)` shape both work.
+function Event(type, init) {
+    init = init || {};
+    this.type = String(type);
+    this.bubbles = !!init.bubbles;
+    this.cancelable = !!init.cancelable;
+    this.composed = !!init.composed;
+    this.target = null;
+    this.currentTarget = null;
+    this.defaultPrevented = false;
+    var stopped = false;
+    var self = this;
+    this.preventDefault = function() {
+        if (self.cancelable) self.defaultPrevented = true;
+    };
+    this.stopPropagation = function() { stopped = true; };
+    this.stopImmediatePropagation = function() { stopped = true; };
+    this.eventPhase = 0;
+    this.isTrusted = false;
+    this.timeStamp = Date.now();
+}
+function CustomEvent(type, init) {
+    Event.call(this, type, init);
+    this.detail = (init && init.detail !== undefined) ? init.detail : null;
+}
+
 // Promise.allSettled polyfill. Returns a Promise that
 // resolves to [{status, value | reason}, …] after every
 // input Promise settles, in input order.
@@ -3341,6 +3597,12 @@ window.atob = atob;
 window.URL = URL;
 window.URLSearchParams = URLSearchParams;
 window.structuredClone = structuredClone;
+window.AbortController = AbortController;
+window.AbortSignal = AbortSignal;
+window.FormData = FormData;
+window.Headers = Headers;
+window.Event = Event;
+window.CustomEvent = CustomEvent;
 window.console = console;
 window.globalThis = window;
 window.self = window;
@@ -3818,6 +4080,73 @@ mod tests {
             "document.querySelector('#p1').childNodes[0].nodeName",
         );
         assert_eq!(name, "#text");
+    }
+
+    #[test]
+    fn abort_controller_signals_listeners() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+
+        let (got, _) = engine.eval_with_output(
+            "(function(){\
+                 var c = new AbortController();\
+                 var fired = 0;\
+                 c.signal.addEventListener('abort', function(){ fired = fired + 1; });\
+                 if (c.signal.aborted) return 'pre-aborted';\
+                 c.abort();\
+                 return fired + ',' + c.signal.aborted;\
+             })()",
+        );
+        assert_eq!(got, "1,true");
+    }
+
+    #[test]
+    fn form_data_round_trips() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+
+        let (got, _) = engine.eval_with_output(
+            "(function(){\
+                 var f = new FormData();\
+                 f.append('q', 'hello');\
+                 f.append('q', 'world');\
+                 f.set('lang', 'en');\
+                 return f.get('q') + ',' + f.getAll('q').length + ',' + f.get('lang');\
+             })()",
+        );
+        assert_eq!(got, "hello,2,en");
+    }
+
+    #[test]
+    fn headers_case_insensitive_get() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+
+        let (got, _) = engine.eval_with_output(
+            "(function(){\
+                 var h = new Headers({'Content-Type': 'application/json'});\
+                 return h.get('content-type') + ',' + h.has('CONTENT-TYPE');\
+             })()",
+        );
+        assert_eq!(got, "application/json,true");
+    }
+
+    #[test]
+    fn custom_event_construction() {
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body></body>");
+        let _ctx = BindingContext::install(&mut engine, doc, String::new());
+
+        let (got, _) = engine.eval_with_output(
+            "(function(){\
+                 var e = new CustomEvent('myevent', { detail: { x: 42 }, bubbles: true });\
+                 return e.type + ',' + e.detail.x + ',' + e.bubbles;\
+             })()",
+        );
+        assert_eq!(got, "myevent,42,true");
     }
 
     /// URL component decomposition. Zinc's `p.toString()` direct
