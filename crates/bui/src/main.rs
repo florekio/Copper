@@ -1075,6 +1075,73 @@ fn fetch_and_decode_image(url: &Url) -> Option<bui_image::Image> {
     }
 }
 
+/// Pick the best favicon href declared in the document head, preferring
+/// formats we can actually decode (png / svg / gif / jpeg) over `.ico`
+/// (which our decoder doesn't handle). Recognises `rel="icon"`,
+/// `rel="shortcut icon"`, and `rel="apple-touch-icon"`. Returns the raw,
+/// unresolved href; `None` means the page declared no icon link and the
+/// caller should fall back to `/favicon.ico`.
+fn find_favicon_href(doc: &bui_dom::Document) -> Option<String> {
+    let mut best: Option<(i32, String)> = None; // (score, href), higher wins
+    for nid in doc.descendants(doc.root) {
+        let Some(elem) = doc.element(nid) else { continue };
+        if elem.name != "link" {
+            continue;
+        }
+        let rel = elem.get_attr("rel").unwrap_or("");
+        let is_icon = rel
+            .split_ascii_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("icon"));
+        let is_apple = rel
+            .split_ascii_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("apple-touch-icon"));
+        if !is_icon && !is_apple {
+            continue;
+        }
+        let Some(href) = elem.get_attr("href") else { continue };
+        // data: URIs aren't fetchable via the network client; skip them
+        // (the /favicon.ico fallback still applies).
+        if href.trim_start().to_ascii_lowercase().starts_with("data:") {
+            continue;
+        }
+        let lower = href.to_ascii_lowercase();
+        let fmt_score = if lower.ends_with(".png") || lower.ends_with(".svg") {
+            3
+        } else if lower.ends_with(".gif") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+            2
+        } else if lower.ends_with(".ico") {
+            0
+        } else {
+            1 // extension-less or query-string icon endpoints
+        };
+        // A plain rel="icon" beats apple-touch-icon at equal format score.
+        let score = fmt_score * 2 + if is_icon { 1 } else { 0 };
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, href.to_string()));
+        }
+    }
+    best.map(|(_, href)| href)
+}
+
+/// Resolve and load the page favicon, returning the GPU upload-cache key
+/// (its absolute URL) once the bytes decode and are queued. Best-effort:
+/// any failure — no icon link, a network error, or an undecodable `.ico`
+/// — returns `None`, and the chrome just shows no icon. Internal pages
+/// (start page, etc.) never carry a favicon.
+fn load_favicon(base: &Url, declared_href: Option<String>) -> Option<String> {
+    if base.is_internal() {
+        return None;
+    }
+    let url = match declared_href {
+        Some(href) => base.join(&href).ok()?,
+        None => base.join("/favicon.ico").ok()?,
+    };
+    let key = url.to_string();
+    let image = fetch_and_decode_image(&url)?;
+    bui_gpu::enqueue_upload(key.clone(), image);
+    Some(key)
+}
+
 /// Rasterise an SVG into a small RGBA8 buffer suitable for the
 /// background-image cache. Real browsers re-rasterise at the box's
 /// painted size each time; we cache once at the SVG's intrinsic
@@ -1205,6 +1272,11 @@ struct TabState {
     /// state they set up during the initial script pass. Cleared
     /// on every navigation (each new page gets a fresh engine).
     js_ctx: Option<bui_js::JsContext>,
+    /// GPU upload-cache key (the favicon's absolute URL) for this
+    /// page's favicon, once its bytes have been fetched + decoded +
+    /// queued. `None` when the page declares no usable icon or the
+    /// fetch/decode failed — the chrome simply shows no icon then.
+    favicon_key: Option<String>,
 }
 
 #[derive(Default, Debug)]
@@ -1367,6 +1439,10 @@ impl TabState {
             })
             .unwrap_or_else(|| url.host.clone());
         let (images, svgs) = preload_images(&url, &dlocked);
+        // Read the favicon href while the doc is locked; the actual
+        // fetch/decode happens after we drop the lock (below) so we
+        // don't hold it across network I/O.
+        let favicon_href = find_favicon_href(&dlocked);
 
         // HTML autofocus: if any <input>/<textarea> on the page
         // declares the autofocus attribute, focus it on first
@@ -1415,6 +1491,10 @@ impl TabState {
         // layout pass will re-acquire it.
         drop(dlocked);
 
+        // Load the favicon now that the lock is released. Best-effort:
+        // a missing or undecodable icon just leaves `favicon_key` None.
+        let favicon_key = load_favicon(url, favicon_href);
+
         // Cap the source-view buffer so the dev-dock doesn't blow up
         // on a 5 MB page. 64 KB is plenty for "read the head + first
         // few hundred lines of body".
@@ -1448,6 +1528,7 @@ impl TabState {
             focused_input: autofocus_target,
             page_selection: None,
             js_ctx: Some(js_ctx),
+            favicon_key,
         })
     }
 
@@ -1470,6 +1551,7 @@ impl TabState {
         self.net_log = next.net_log;
         self.console_log = next.console_log;
         self.source_html = next.source_html;
+        self.favicon_key = next.favicon_key;
         self.layout = None;
         self.last_width = 0;
         self.page_inputs.clear();
@@ -2099,6 +2181,7 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
     }
 
     // Top bar (nav + URL pill, to the right of the sidebar).
+    let active_favicon = st.active_tab().favicon_key.clone();
     paint_chrome(
         viewport.width,
         viewport.cursor,
@@ -2109,6 +2192,7 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         can_back,
         can_forward,
         sidebar_w,
+        active_favicon.as_deref(),
         &mut dl,
     );
 
@@ -2990,6 +3074,7 @@ fn paint_chrome(
     can_back: bool,
     can_forward: bool,
     sidebar_w: f32,
+    favicon: Option<&str>,
     dl: &mut DisplayList,
 ) {
     let w = width as f32;
@@ -3079,10 +3164,27 @@ fn paint_chrome(
             );
         }
     } else {
-        let visible = truncate_to_width(url, url_font, URL_FONT_SIZE, max_w);
+        // Site favicon at the pill's left edge (only while not editing,
+        // so the caret / click hit-testing against `text_origin_x` stays
+        // exact). When present, the URL text shifts right to make room.
+        let (fav_text_origin, fav_max_w) = if let Some(key) = favicon {
+            const FAVICON_SIZE: f32 = 16.0;
+            let fav_x = addr_rect.x + 8.0;
+            let fav_y = addr_rect.y + (addr_rect.h - FAVICON_SIZE) * 0.5;
+            dl.image(
+                Rect::new(fav_x, fav_y, FAVICON_SIZE, FAVICON_SIZE),
+                key.to_string(),
+            );
+            // Text begins past the icon (icon end + 6px gap).
+            let origin = fav_x + FAVICON_SIZE + 6.0;
+            (origin, (addr_rect.x + addr_rect.w - 16.0 - origin).max(0.0))
+        } else {
+            (text_origin_x, max_w)
+        };
+        let visible = truncate_to_width(url, url_font, URL_FONT_SIZE, fav_max_w);
         let advance = url_font.measure_text(&visible, URL_FONT_SIZE);
         dl.commands.push(PaintCommand::Text {
-            x: text_origin_x,
+            x: fav_text_origin,
             baseline,
             advance,
             font_size: URL_FONT_SIZE,
@@ -4157,6 +4259,7 @@ mod tests {
             focused_input: None,
             page_selection: None,
             js_ctx: None,
+            favicon_key: None,
         }
     }
 
@@ -4206,6 +4309,7 @@ mod tests {
             focused_input: None,
             page_selection: None,
             js_ctx: None,
+            favicon_key: None,
         };
         let url = build_form_url(&tab, form).expect("form url");
         assert_eq!(url.path, "/search");
