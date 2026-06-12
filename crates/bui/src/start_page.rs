@@ -73,8 +73,8 @@ const START_HTML: &str = r##"<!DOCTYPE html>
       <p class="url">example.com</p>
     </div>
     <div class="card">
-      <p class="label"><a href="https://google.com">Google</a></p>
-      <p class="url">google.com</p>
+      <p class="label"><a href="https://duckduckgo.com">DuckDuckGo</a></p>
+      <p class="url">duckduckgo.com</p>
     </div>
     <div class="card">
       <p class="label"><a href="https://en.wikipedia.org/wiki/Web_browser">Web browser</a></p>
