@@ -30,4 +30,14 @@ check 'item-gamma' 'third list item'
 OUT=$(cargo run -q --bin copper -- layout "http://127.0.0.1:$PORT/preact.html" 2>/dev/null)
 check 'PREACT-SMOKE-HEADING' 'h1 rendered by Preact'
 check 'p-item-one' 'preact list item'
+
+# Interactivity: synthetic click -> onClick -> useState -> re-render.
+# The fixture polls and prints INTERACTIVE-OK once COUNT:1 commits.
+IOUT=$(cargo run -q --bin copper -- layout "http://127.0.0.1:$PORT/counter.html" 2>&1 >/dev/null)
+if echo "$IOUT" | grep -q 'INTERACTIVE-OK'; then
+  echo "OK  : click -> setState -> re-render"
+else
+  echo "FAIL: click -> setState -> re-render"
+  fail=1
+fi
 if [ $fail -eq 0 ]; then echo "react_smoke: OK"; else echo "react_smoke: FAILED"; exit 1; fi

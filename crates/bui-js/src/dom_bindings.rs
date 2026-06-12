@@ -1030,6 +1030,26 @@ impl BindingContext {
             }
         });
 
+        // nodeValue SETTER for text/comment nodes. React's
+        // setTextContent fast path writes `firstChild.nodeValue = text`
+        // when an element already has a sole text child — without this
+        // it silently no-opped and re-renders never updated text.
+        let s = shared.clone();
+        engine.register_host_fn("__setNodeValue", move |vm, _this, args| {
+            let Some(handle) = args.first().copied() else { return Ok(Value::null()) };
+            let text = read_str(vm, args.get(1)).unwrap_or_default();
+            let dom = s.lock().unwrap();
+            let Some(nid) = dom.node_for_handle(handle) else { return Ok(Value::null()) };
+            {
+                let mut d = dom.doc_handle.lock().unwrap();
+                if let NodeKind::Text(t) = &mut d.node_mut(nid).kind {
+                    *t = text;
+                }
+            }
+            dom.mark_dirty();
+            Ok(Value::null())
+        });
+
         let s = shared.clone();
         engine.register_host_fn("__elemDataset", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else {
@@ -2055,6 +2075,59 @@ impl BindingContext {
             Ok(Value::null())
         });
 
+        // Synthetic event dispatch from JS (`el.click()`,
+        // `el.dispatchEvent(ev)`). Runs the same capture → target →
+        // bubble walk over the same listener map as embedder-driven
+        // input, so React's root-container delegation sees synthetic
+        // clicks exactly like real ones. The preventDefault /
+        // stopPropagation callables resolve after install — they're
+        // filled into `dispatch_fns` then.
+        let dispatch_fns: Arc<Mutex<Option<(Value, Value)>>> = Arc::new(Mutex::new(None));
+        let s = shared.clone();
+        let listeners_for_de = listeners.clone();
+        let flags_for_de = event_flags.clone();
+        let fns_for_de = dispatch_fns.clone();
+        engine.register_host_fn("__elemDispatchEvent", move |vm, _this, args| {
+            let Some(target_h) = args.first().copied() else {
+                return Ok(Value::boolean(false));
+            };
+            let kind = read_str(vm, args.get(1)).unwrap_or_default();
+            if kind.is_empty() {
+                return Ok(Value::boolean(false));
+            }
+            // Resolve node + ancestor path + target handle under the
+            // locks, then drop them: listeners re-enter host fns.
+            let (node, path, target_handle) = {
+                let mut dom = s.lock().unwrap();
+                let Some(node) = dom.node_for_handle(target_h) else {
+                    return Ok(Value::boolean(false));
+                };
+                let path = {
+                    let d = dom.doc_handle.lock().unwrap();
+                    crate::events::ancestor_path(&d, node)
+                };
+                let handle = dom.ensure_handle(Some(node), vm, elem_tag);
+                (node, path, handle)
+            };
+            let (pd, sp) = match *fns_for_de.lock().unwrap() {
+                Some(pair) => pair,
+                None => (Value::null(), Value::null()),
+            };
+            let ctx = crate::events::EventDispatchCtx {
+                event_flags: flags_for_de.clone(),
+                prevent_default_fn: pd,
+                stop_propagation_fn: sp,
+                target_handle: Some(target_handle),
+            };
+            let event = crate::events::Event::new(&kind, node);
+            let out = listeners_for_de
+                .lock()
+                .unwrap()
+                .dispatch_js_path(path, event, vm, &ctx);
+            Ok(Value::boolean(!out.flags.default_prevented))
+        });
+
+
         // ---- MutationObserver registry ----
         //
         // `__newMutationObserver(callback)` allocates an entry
@@ -2289,6 +2362,7 @@ impl BindingContext {
         let stop_propagation_fn = engine
             .eval("__eventStopPropagation")
             .unwrap_or(Value::null());
+        *dispatch_fns.lock().unwrap() = Some((prevent_default_fn, stop_propagation_fn));
 
         BindingContext {
             shared,
@@ -2508,8 +2582,9 @@ fn engine_alloc_host_object_via_vm(
 
 fn read_str(vm: &zinc::vm::vm::Vm, val: Option<&Value>) -> Option<String> {
     let v = val.copied()?;
-    let id = v.as_string_id()?;
-    Some(vm.interner().resolve(id).to_string())
+    // string_content flattens ConsStrings (runtime `a + b` concats)
+    // too — resolving only interned ids turned them into "".
+    vm.string_content(v)
 }
 
 fn collect_text(doc: &Document, node: NodeId, out: &mut String) {
@@ -2539,8 +2614,20 @@ fn find_body(doc: &Document) -> Option<NodeId> {
 }
 
 const PRELUDE: &str = r#"
+// One wrapper per host handle: React (and friends) store expando
+// properties (__reactFiber$..., __reactProps$...) on the wrapper a
+// node was created as, and look them up on the wrapper an event
+// delivers. Fresh objects per call broke that identity.
+var __wrapCache = new Map();
 function _wrapElem(handle) {
     if (handle === null || handle === undefined) return null;
+    var cached = __wrapCache.get(handle);
+    if (cached !== undefined) return cached;
+    var wrapper = _makeElemWrapper(handle);
+    __wrapCache.set(handle, wrapper);
+    return wrapper;
+}
+function _makeElemWrapper(handle) {
     return {
         _h: handle,
         get tagName() { return __elemTagName(this._h); },
@@ -2675,12 +2762,14 @@ function _wrapElem(handle) {
         // dispatchEvent — when called from JS, fire the event
         // through our internal listener map. Currently a stub
         // that returns `!event.defaultPrevented` so feature-
-        // probe code gets a truthy answer; real cross-target
-        // dispatch needs re-entrant listener-map access which
-        // is the explicit follow-up.
+        // Real synthetic dispatch: runs the same capture → target →
+        // bubble walk over the same listener map as embedder input,
+        // so delegated frameworks (React's root-container listeners)
+        // see synthetic events exactly like real ones.
         dispatchEvent: function(event) {
-            if (event && event.defaultPrevented) return false;
-            return true;
+            var t = event && event.type ? String(event.type) : '';
+            if (!t) return false;
+            return __elemDispatchEvent(this._h, t);
         },
         // Form-control value. For <input> reads the `value`
         // attribute. For <textarea> reads the text content.
@@ -2734,6 +2823,7 @@ function _wrapElem(handle) {
         get nodeType() { return __nodeType(this._h); },
         get nodeName() { return __nodeName(this._h); },
         get nodeValue() { return __nodeValue(this._h); },
+        set nodeValue(v) { __setNodeValue(this._h, v == null ? '' : String(v)); },
         // childNodes walks first / next sibling to build a
         // NodeList of every child (elements + text nodes), as
         // opposed to `children` which is element-only.
@@ -2802,7 +2892,7 @@ function _wrapElem(handle) {
         },
         focus: __noop,
         blur: __noop,
-        click: __noop,
+        click: function() { return __elemDispatchEvent(this._h, 'click'); },
         scrollIntoView: __noop,
         scrollTo: __noop,
         scrollBy: __noop,

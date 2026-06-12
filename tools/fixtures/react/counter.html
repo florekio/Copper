@@ -1,0 +1,31 @@
+<html><body><div id="root"></div>
+<script src="react.js"></script>
+<script src="react-dom.js"></script>
+<script>
+var e = React.createElement;
+function Counter() {
+  var s = React.useState(0);
+  var n = s[0], setN = s[1];
+  return e('div', null,
+    e('button', { id: 'btn', onClick: function () { setN(n + 1); } }, 'inc'),
+    e('p', null, 'COUNT:' + n));
+}
+ReactDOM.createRoot(document.getElementById('root')).render(e(Counter));
+var clicked = false;
+function drive(i) {
+  var btn = document.getElementById('btn');
+  var root = document.getElementById('root');
+  var text = root.textContent || '';
+  if (btn && !clicked) {
+    clicked = true;
+    console.log('clicking; before=' + text);
+    btn.click();
+  } else if (clicked && text.indexOf('COUNT:1') !== -1) {
+    console.log('INTERACTIVE-OK: ' + text);
+    return;
+  }
+  if (i > 60) { console.log('GAVE-UP: ' + text); return; }
+  setTimeout(function(){ drive(i + 1); }, 0);
+}
+drive(0);
+</script></body></html>
