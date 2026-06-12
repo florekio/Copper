@@ -23,6 +23,7 @@
 //!     ⌘U          check for updates / restart into a staged update
 
 mod address_input;
+mod png_out;
 mod start_page;
 
 use std::io::Write;
@@ -147,6 +148,8 @@ fn main() -> ExitCode {
     let mut parse_html = false;
     let mut layout_grep: Option<String> = None;
     let mut layout_width: f32 = 1400.0;
+    let mut shot_height: f32 = 900.0;
+    let mut shot_out: Option<String> = None;
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < raw.len() {
@@ -166,6 +169,18 @@ fn main() -> ExitCode {
                     layout_width = w;
                 }
             }
+            "--height" => {
+                i += 1;
+                if let Some(h) = raw.get(i).and_then(|s| s.parse::<f32>().ok()) {
+                    shot_height = h;
+                }
+            }
+            "-o" | "--out" => {
+                i += 1;
+                if let Some(p) = raw.get(i) {
+                    shot_out = Some(p.clone());
+                }
+            }
             other => positional.push(other),
         }
         i += 1;
@@ -176,13 +191,19 @@ fn main() -> ExitCode {
         ["render", url] => run_browser(url),
         ["fetch", url] => run_fetch(url, show_headers, parse_html),
         ["layout", url] => run_layout_debug(url, layout_width, layout_grep.as_deref()),
+        ["screenshot", url] => run_screenshot(
+            url,
+            layout_width,
+            shot_height,
+            shot_out.as_deref().unwrap_or("screenshot.png"),
+        ),
         [url] if url.starts_with("http://") || url.starts_with("https://") => {
             run_fetch(url, show_headers, parse_html)
         }
         ["parse", path] => run_parse_file(path),
         _ => {
             eprintln!(
-                "usage:\n  copper                  open window\n  copper render <url>     fetch + render in window\n  copper <https-url>      fetch URL, dump body\n  copper --parse <url>    fetch URL, dump DOM tree\n  copper parse <file>     parse local file, dump DOM tree\n  copper --headers <url>  print response headers to stderr\n  copper layout <url>     fetch + build layout tree, dump per-box frames\n     [--width N]          set viewport width (default 1400)\n     [--grep TOKEN]       only show boxes whose element id/class contains TOKEN (and ancestors)"
+                "usage:\n  copper                  open window\n  copper render <url>     fetch + render in window\n  copper <https-url>      fetch URL, dump body\n  copper --parse <url>    fetch URL, dump DOM tree\n  copper parse <file>     parse local file, dump DOM tree\n  copper --headers <url>  print response headers to stderr\n  copper layout <url>     fetch + build layout tree, dump per-box frames\n     [--width N]          set viewport width (default 1400)\n     [--grep TOKEN]       only show boxes whose element id/class contains TOKEN (and ancestors)\n  copper screenshot <url> fetch + render headless, write PNG\n     [--width N]          viewport width (default 1400)\n     [--height N]         viewport height (default 900)\n     [-o FILE]            output path (default screenshot.png)"
             );
             ExitCode::from(2)
         }
@@ -458,6 +479,73 @@ fn run_layout_debug(url_str: &str, viewport_w: f32, grep: Option<&str>) -> ExitC
         println!("{}{}", "  ".repeat(*depth), line);
     }
     ExitCode::SUCCESS
+}
+
+/// Headless render: same fetch + JS-settle + style + layout + paint
+/// pipeline as the window, but the display list goes to an offscreen
+/// GPU target and out as a PNG. The output contains ONLY page content
+/// at exactly `viewport_w × viewport_h` — no chrome, no padding — so
+/// it can be diffed against a real browser's screenshot of the same
+/// viewport.
+fn run_screenshot(url_str: &str, viewport_w: f32, viewport_h: f32, out_path: &str) -> ExitCode {
+    let url = match Url::parse(url_str) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid URL: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    bui_style::set_viewport(viewport_w, viewport_h);
+    let tab = match TabState::fetch(&url) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("screenshot fetch failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dlocked = tab.doc.lock().unwrap();
+    let mut bx = bui_layout::build_with_images(
+        &dlocked,
+        &tab.style,
+        &tab.images,
+        &tab.svgs,
+        tab.body_node,
+    );
+    drop(dlocked);
+    bui_layout::layout(&mut bx, 0.0, 0.0, viewport_w);
+
+    let mut dl = DisplayList::new();
+    // Pages assume a white default canvas; the offscreen target's
+    // base color is also white, this makes it explicit.
+    dl.fill_rect(Rect::new(0.0, 0.0, viewport_w, viewport_h), VIEWPORT_BG);
+    bui_layout::paint(&bx, &mut dl);
+
+    let mut hr = match shared_runtime()
+        .block_on(bui_gpu::HeadlessRenderer::new(viewport_w as u32, viewport_h as u32))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("headless GPU init failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rgba = match hr.render_to_rgba(&dl) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("render failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match png_out::write_png(out_path, viewport_w as u32, viewport_h as u32, &rgba) {
+        Ok(()) => {
+            eprintln!("wrote {out_path} ({}x{})", viewport_w as u32, viewport_h as u32);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// One stylesheet's origin, recorded in document order so the cascade

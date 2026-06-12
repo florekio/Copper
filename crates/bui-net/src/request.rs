@@ -78,7 +78,15 @@ impl Request {
         }
 
         if !has_ua {
-            out.extend_from_slice(b"User-Agent: bui/0.1\r\n");
+            // Mozilla/5.0-shaped compatibility string, like every real
+            // browser ships. With a bare `bui/0.1` UA, servers route us
+            // to degraded variants — DuckDuckGo serves a stripped
+            // "minimal homepage" with the hero and nav sections absent.
+            // Copper is named in the product slot for honest telemetry.
+            out.extend_from_slice(
+                b"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Copper/0.1 Safari/537.36\r\n",
+            );
         }
         if !has_accept {
             out.extend_from_slice(b"Accept: */*\r\n");

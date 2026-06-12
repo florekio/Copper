@@ -3718,9 +3718,68 @@ document.removeEventListener = __noop;
 // (document.documentElement is now a getter on the document
 // literal above — returns a wrapped Element for the <html>
 // node so dataset / classList / addEventListener all work.)
+// Standard Location fields all derive from the current URL string.
+// Sites branch on these constantly (DuckDuckGo's SSG script parses
+// location.search by hand when URLSearchParams is missing).
+function __loc_no_hash() {
+    var u = __current_url();
+    var h = u.indexOf('#');
+    return h >= 0 ? u.slice(0, h) : u;
+}
+function __loc_authority() {
+    var u = __loc_no_hash();
+    var ss = u.indexOf('//');
+    if (ss < 0) return '';
+    var rest = u.slice(ss + 2);
+    var end = rest.length;
+    var q = rest.indexOf('?'); if (q >= 0 && q < end) end = q;
+    var p = rest.indexOf('/'); if (p >= 0 && p < end) end = p;
+    return rest.slice(0, end);
+}
 var location = {
     get href() { return __current_url(); },
     set href(v) { __navigate(v); },
+    get protocol() {
+        var u = __current_url();
+        var c = u.indexOf(':');
+        return c >= 0 ? u.slice(0, c + 1) : '';
+    },
+    get host() { return __loc_authority(); },
+    get hostname() {
+        var h = __loc_authority();
+        var c = h.indexOf(':');
+        return c >= 0 ? h.slice(0, c) : h;
+    },
+    get port() {
+        var h = __loc_authority();
+        var c = h.indexOf(':');
+        return c >= 0 ? h.slice(c + 1) : '';
+    },
+    get origin() {
+        var u = __current_url();
+        var c = u.indexOf(':');
+        return (c >= 0 ? u.slice(0, c + 1) : '') + '//' + __loc_authority();
+    },
+    get pathname() {
+        var u = __loc_no_hash();
+        var q = u.indexOf('?');
+        if (q >= 0) u = u.slice(0, q);
+        var ss = u.indexOf('//');
+        if (ss < 0) return '/';
+        var p = u.indexOf('/', ss + 2);
+        return p >= 0 ? u.slice(p) : '/';
+    },
+    get search() {
+        var u = __loc_no_hash();
+        var q = u.indexOf('?');
+        return q >= 0 && q < u.length - 1 ? u.slice(q) : '';
+    },
+    get hash() {
+        var u = __current_url();
+        var h = u.indexOf('#');
+        return h >= 0 && h < u.length - 1 ? u.slice(h) : '';
+    },
+    toString: function() { return __current_url(); },
     assign: __navigate,
     replace: __navigate,
     reload: __noop

@@ -131,148 +131,14 @@ impl Compositor {
         self.drain_upload_queue();
         self.scene.reset();
         let global = Affine::scale(self.scale_factor);
-        for cmd in &list.commands {
-            match cmd {
-                PaintCommand::FillRect { rect, color } => {
-                    let kr = KurboRect::new(
-                        rect.x as f64,
-                        rect.y as f64,
-                        (rect.x + rect.w) as f64,
-                        (rect.y + rect.h) as f64,
-                    );
-                    self.scene
-                        .fill(Fill::NonZero, global, vello_color(*color), None, &kr);
-                }
-                PaintCommand::FillRoundedRect { rect, color, radii } => {
-                    let kr = KurboRoundedRect::new(
-                        rect.x as f64,
-                        rect.y as f64,
-                        (rect.x + rect.w) as f64,
-                        (rect.y + rect.h) as f64,
-                        RoundedRectRadii::new(
-                            radii[0] as f64,
-                            radii[1] as f64,
-                            radii[2] as f64,
-                            radii[3] as f64,
-                        ),
-                    );
-                    self.scene
-                        .fill(Fill::NonZero, global, vello_color(*color), None, &kr);
-                }
-                PaintCommand::FillPath { points, color } => {
-                    if !points.is_empty() {
-                        let mut path = BezPath::new();
-                        path.move_to((points[0].0 as f64, points[0].1 as f64));
-                        for p in &points[1..] {
-                            path.line_to((p.0 as f64, p.1 as f64));
-                        }
-                        path.close_path();
-                        self.scene.fill(
-                            Fill::NonZero,
-                            global,
-                            vello_color(*color),
-                            None,
-                            &path,
-                        );
-                    }
-                }
-                PaintCommand::Image { rect, key } => {
-                    if let Some(image) = self.images.get(key) {
-                        let sx = rect.w as f64 / image.width.max(1) as f64;
-                        let sy = rect.h as f64 / image.height.max(1) as f64;
-                        let transform = global
-                            * Affine::translate(Vec2::new(rect.x as f64, rect.y as f64))
-                            * Affine::scale_non_uniform(sx, sy);
-                        self.scene.draw_image(image, transform);
-                    }
-                }
-                PaintCommand::Text {
-                    x,
-                    baseline,
-                    advance: _,
-                    font_size,
-                    color,
-                    content,
-                } => {
-                    paint_text_cached(
-                        &mut self.scene,
-                        &self.font,
-                        &mut self.glyph_cache,
-                        global,
-                        content,
-                        *x,
-                        *baseline,
-                        *font_size,
-                        *color,
-                    );
-                }
-                PaintCommand::PushClip { rect, radii } => {
-                    let kr = KurboRoundedRect::new(
-                        rect.x as f64,
-                        rect.y as f64,
-                        (rect.x + rect.w) as f64,
-                        (rect.y + rect.h) as f64,
-                        RoundedRectRadii::new(
-                            radii[0] as f64,
-                            radii[1] as f64,
-                            radii[2] as f64,
-                            radii[3] as f64,
-                        ),
-                    );
-                    self.scene.push_clip_layer(Fill::NonZero, global, &kr);
-                }
-                PaintCommand::PopClip => {
-                    self.scene.pop_layer();
-                }
-                PaintCommand::BoxShadow {
-                    rect,
-                    color,
-                    radius,
-                    blur,
-                } => {
-                    let kr = KurboRect::new(
-                        rect.x as f64,
-                        rect.y as f64,
-                        (rect.x + rect.w) as f64,
-                        (rect.y + rect.h) as f64,
-                    );
-                    // CSS blur-radius is roughly 2× the gaussian std dev.
-                    let std_dev = (*blur as f64) * 0.5;
-                    self.scene.draw_blurred_rounded_rect(
-                        global,
-                        kr,
-                        vello_color(*color),
-                        *radius as f64,
-                        std_dev.max(0.5),
-                    );
-                }
-                PaintCommand::Svg {
-                    rect,
-                    view_box,
-                    segments,
-                    fill,
-                    stroke,
-                    stroke_width,
-                } => {
-                    paint_svg_shape(
-                        &mut self.scene,
-                        global,
-                        rect,
-                        *view_box,
-                        segments,
-                        *fill,
-                        *stroke,
-                        *stroke_width,
-                    );
-                }
-                // Sticky groups are resolved upstream by the scroll-shift
-                // pass — they should never reach the GPU. Ignore defensively
-                // so a future renderer path that bypasses the shift loop
-                // still compiles instead of panicking.
-                PaintCommand::PushStickyGroup { .. }
-                | PaintCommand::PopStickyGroup => {}
-            }
-        }
+        encode_display_list(
+            &mut self.scene,
+            list,
+            global,
+            &self.images,
+            &self.font,
+            &mut self.glyph_cache,
+        );
 
         let device_handle = &self.context.devices[self.surface.dev_id];
         let device = &device_handle.device;
@@ -308,6 +174,331 @@ impl Compositor {
 
         Ok(())
     }
+}
+
+/// Offscreen counterpart to [`Compositor`]: same vello renderer, same
+/// display-list encoding, but the target is a plain `Rgba8Unorm`
+/// texture that gets read back to CPU memory instead of presented to a
+/// window. Powers `copper screenshot`.
+pub struct HeadlessRenderer {
+    context: RenderContext,
+    dev_id: usize,
+    renderer: Renderer,
+    scene: Scene,
+    font: Font,
+    images: HashMap<String, ImageData>,
+    glyph_cache: HashMap<(u32, [u8; 4]), ImageData>,
+    width: u32,
+    height: u32,
+    target: wgpu::Texture,
+    target_view: wgpu::TextureView,
+}
+
+impl HeadlessRenderer {
+    pub async fn new(width: u32, height: u32) -> Result<Self, CompositorError> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let mut context = RenderContext::new();
+        let dev_id = context
+            .device(None)
+            .await
+            .ok_or_else(|| CompositorError::Vello("no compatible GPU device".into()))?;
+        let device = &context.devices[dev_id].device;
+        let renderer = Renderer::new(
+            device,
+            RendererOptions {
+                use_cpu: false,
+                antialiasing_support: AaSupport::all(),
+                num_init_threads: NonZeroUsize::new(1),
+                pipeline_cache: None,
+            },
+        )
+        .map_err(|e| CompositorError::Vello(format!("{e:?}")))?;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bui-gpu headless target"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        Ok(Self {
+            context,
+            dev_id,
+            renderer,
+            scene: Scene::new(),
+            font: bui_text::shared_font().clone(),
+            images: HashMap::new(),
+            glyph_cache: HashMap::new(),
+            width,
+            height,
+            target,
+            target_view,
+        })
+    }
+
+    /// Render `list` and return tightly-packed RGBA8 pixels
+    /// (width × height × 4, row-major, non-premultiplied).
+    pub fn render_to_rgba(&mut self, list: &DisplayList) -> Result<Vec<u8>, CompositorError> {
+        // Pick up images decoded by the page loader — same global
+        // queue the windowed compositor drains.
+        if let Some(queue) = UPLOAD_QUEUE.get() {
+            let drained: Vec<_> = queue.lock().unwrap().drain(..).collect();
+            for (key, img) in drained {
+                let blob: Blob<u8> = Blob::from(img.pixels);
+                self.images.insert(key, ImageData {
+                    data: blob,
+                    format: ImageFormat::Rgba8,
+                    alpha_type: ImageAlphaType::Alpha,
+                    width: img.width,
+                    height: img.height,
+                });
+            }
+        }
+        self.scene.reset();
+        encode_display_list(
+            &mut self.scene,
+            list,
+            Affine::IDENTITY,
+            &self.images,
+            &self.font,
+            &mut self.glyph_cache,
+        );
+
+        let device_handle = &self.context.devices[self.dev_id];
+        let device = &device_handle.device;
+        let queue = &device_handle.queue;
+        self.renderer
+            .render_to_texture(
+                device,
+                queue,
+                &self.scene,
+                &self.target_view,
+                &RenderParams {
+                    base_color: VelloColor::from_rgba8(255, 255, 255, 255),
+                    width: self.width,
+                    height: self.height,
+                    antialiasing_method: AaConfig::Area,
+                },
+            )
+            .map_err(|e| CompositorError::Vello(format!("{e:?}")))?;
+
+        // wgpu requires bytes_per_row aligned to 256 for buffer copies;
+        // copy padded, then strip the padding per row.
+        let unpadded = self.width as usize * 4;
+        let padded = (unpadded + 255) & !255;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bui-gpu readback"),
+            size: (padded * self.height as usize) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bui-gpu readback copy"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| CompositorError::Vello(format!("poll: {e:?}")))?;
+        rx.recv()
+            .map_err(|_| CompositorError::Vello("readback channel closed".into()))?
+            .map_err(|e| CompositorError::Vello(format!("map: {e:?}")))?;
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity(unpadded * self.height as usize);
+        for row in 0..self.height as usize {
+            let start = row * padded;
+            out.extend_from_slice(&data[start..start + unpadded]);
+        }
+        drop(data);
+        buf.unmap();
+        Ok(out)
+    }
+}
+
+/// Translate a `DisplayList` into vello scene commands. Shared by the
+/// windowed [`Compositor`] and the offscreen [`HeadlessRenderer`] so
+/// both paint identically.
+fn encode_display_list(
+    scene: &mut Scene,
+    list: &DisplayList,
+    global: Affine,
+    images: &HashMap<String, ImageData>,
+    font: &Font,
+    glyph_cache: &mut HashMap<(u32, [u8; 4]), ImageData>,
+) {
+    for cmd in &list.commands {
+        match cmd {
+                PaintCommand::FillRect { rect, color } => {
+                    let kr = KurboRect::new(
+                        rect.x as f64,
+                        rect.y as f64,
+                        (rect.x + rect.w) as f64,
+                        (rect.y + rect.h) as f64,
+                    );
+                    scene
+                        .fill(Fill::NonZero, global, vello_color(*color), None, &kr);
+                }
+                PaintCommand::FillRoundedRect { rect, color, radii } => {
+                    let kr = KurboRoundedRect::new(
+                        rect.x as f64,
+                        rect.y as f64,
+                        (rect.x + rect.w) as f64,
+                        (rect.y + rect.h) as f64,
+                        RoundedRectRadii::new(
+                            radii[0] as f64,
+                            radii[1] as f64,
+                            radii[2] as f64,
+                            radii[3] as f64,
+                        ),
+                    );
+                    scene
+                        .fill(Fill::NonZero, global, vello_color(*color), None, &kr);
+                }
+                PaintCommand::FillPath { points, color } => {
+                    if !points.is_empty() {
+                        let mut path = BezPath::new();
+                        path.move_to((points[0].0 as f64, points[0].1 as f64));
+                        for p in &points[1..] {
+                            path.line_to((p.0 as f64, p.1 as f64));
+                        }
+                        path.close_path();
+                        scene.fill(
+                            Fill::NonZero,
+                            global,
+                            vello_color(*color),
+                            None,
+                            &path,
+                        );
+                    }
+                }
+                PaintCommand::Image { rect, key } => {
+                    if let Some(image) = images.get(key) {
+                        let sx = rect.w as f64 / image.width.max(1) as f64;
+                        let sy = rect.h as f64 / image.height.max(1) as f64;
+                        let transform = global
+                            * Affine::translate(Vec2::new(rect.x as f64, rect.y as f64))
+                            * Affine::scale_non_uniform(sx, sy);
+                        scene.draw_image(image, transform);
+                    }
+                }
+                PaintCommand::Text {
+                    x,
+                    baseline,
+                    advance: _,
+                    font_size,
+                    color,
+                    content,
+                } => {
+                    paint_text_cached(
+                        scene,
+                        font,
+                        glyph_cache,
+                        global,
+                        content,
+                        *x,
+                        *baseline,
+                        *font_size,
+                        *color,
+                    );
+                }
+                PaintCommand::PushClip { rect, radii } => {
+                    let kr = KurboRoundedRect::new(
+                        rect.x as f64,
+                        rect.y as f64,
+                        (rect.x + rect.w) as f64,
+                        (rect.y + rect.h) as f64,
+                        RoundedRectRadii::new(
+                            radii[0] as f64,
+                            radii[1] as f64,
+                            radii[2] as f64,
+                            radii[3] as f64,
+                        ),
+                    );
+                    scene.push_clip_layer(Fill::NonZero, global, &kr);
+                }
+                PaintCommand::PopClip => {
+                    scene.pop_layer();
+                }
+                PaintCommand::BoxShadow {
+                    rect,
+                    color,
+                    radius,
+                    blur,
+                } => {
+                    let kr = KurboRect::new(
+                        rect.x as f64,
+                        rect.y as f64,
+                        (rect.x + rect.w) as f64,
+                        (rect.y + rect.h) as f64,
+                    );
+                    // CSS blur-radius is roughly 2× the gaussian std dev.
+                    let std_dev = (*blur as f64) * 0.5;
+                    scene.draw_blurred_rounded_rect(
+                        global,
+                        kr,
+                        vello_color(*color),
+                        *radius as f64,
+                        std_dev.max(0.5),
+                    );
+                }
+                PaintCommand::Svg {
+                    rect,
+                    view_box,
+                    segments,
+                    fill,
+                    stroke,
+                    stroke_width,
+                } => {
+                    paint_svg_shape(
+                        scene,
+                        global,
+                        rect,
+                        *view_box,
+                        segments,
+                        *fill,
+                        *stroke,
+                        *stroke_width,
+                    );
+                }
+                // Sticky groups are resolved upstream by the scroll-shift
+                // pass — they should never reach the GPU. Ignore defensively
+                // so a future renderer path that bypasses the shift loop
+                // still compiles instead of panicking.
+                PaintCommand::PushStickyGroup { .. }
+                | PaintCommand::PopStickyGroup => {}
+            }
+        }
+
 }
 
 fn vello_color(c: Color) -> VelloColor {
