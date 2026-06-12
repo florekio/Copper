@@ -724,6 +724,68 @@ fn maybe_rewrite_google_search(url: &Url) -> Url {
     url.clone()
 }
 
+/// Turn an address-bar entry into a navigation URL. A real URL (or a
+/// bare host like `rust-lang.org`) navigates directly; anything else
+/// is a search query, routed to DuckDuckGo's HTML endpoint.
+///
+/// Why DuckDuckGo and not Google: Google's `/search` serves every
+/// non-allowlisted client an anti-bot `enablejs` shell that contains
+/// no results — the results are gated server-side behind TLS/bot
+/// fingerprinting, so even a flawless JS engine renders an empty page.
+/// DuckDuckGo's `html.duckduckgo.com/html` returns real server-rendered
+/// results to any client, which Copper lays out today.
+fn address_entry_to_url(entry: &str) -> Option<Url> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Explicit scheme: navigate as-is.
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Url::parse(trimmed).ok();
+    }
+    // Internal pages (copper://…).
+    if trimmed.starts_with("copper://") {
+        return Url::parse(trimmed).ok();
+    }
+    // Looks like a bare hostname/URL: no spaces, and either a dotted
+    // host (example.com, example.com/path) or localhost[:port].
+    let host_part = trimmed.split(['/', '?', '#']).next().unwrap_or(trimmed);
+    let looks_like_host = !trimmed.contains(' ')
+        && (host_part == "localhost"
+            || host_part.starts_with("localhost:")
+            || (host_part.contains('.')
+                && !host_part.starts_with('.')
+                && !host_part.ends_with('.')));
+    if looks_like_host {
+        return Url::parse(&format!("https://{trimmed}")).ok();
+    }
+    // Otherwise: a search query.
+    Some(search_url(trimmed))
+}
+
+/// DuckDuckGo HTML-results URL for `query`.
+fn search_url(query: &str) -> Url {
+    let encoded = percent_encode_query(query);
+    Url::parse(&format!("https://html.duckduckgo.com/html/?q={encoded}"))
+        .expect("ddg search url is well-formed")
+}
+
+/// Percent-encode a query string for a URL query component. Spaces
+/// become `+`; everything outside the unreserved set is `%XX`.
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Fetch a CSS URL's text. Parsing + `@import` inlining happen at the
 /// caller so multiple sheets can be fetched concurrently.
 ///
@@ -5645,6 +5707,29 @@ mod tests {
     }
 
     #[test]
+    fn address_entry_routes_urls_vs_searches() {
+        let go = |s: &str| address_entry_to_url(s).unwrap().to_string();
+
+        // Explicit scheme → navigate as-is.
+        assert_eq!(go("https://rust-lang.org"), "https://rust-lang.org/");
+        assert!(go("http://example.com/x").starts_with("http://example.com/x"));
+        // Bare host → https://.
+        assert_eq!(go("rust-lang.org"), "https://rust-lang.org/");
+        assert!(go("example.com/path").starts_with("https://example.com/path"));
+        assert!(go("localhost:8080").starts_with("https://localhost:8080"));
+        // Query → DuckDuckGo search.
+        assert!(go("rust programming").starts_with("https://html.duckduckgo.com/html/?q="));
+        assert!(go("rust programming").contains("rust+programming"));
+        // A dotted phrase with spaces is still a search, not a host.
+        assert!(go("what is rust-lang.org").contains("duckduckgo.com"));
+        // Single bare word (no dot, no space) → search, not a host.
+        assert!(go("rust").contains("duckduckgo.com"));
+        // Special chars get percent-encoded.
+        assert!(go("a & b").contains("a+%26+b"));
+        assert!(address_entry_to_url("   ").is_none());
+    }
+
+    #[test]
     fn selection_collects_text_across_paragraphs() {
         // Two paragraphs stacked vertically. A selection that spans
         // both should pick up text from both, with a newline between
@@ -5983,15 +6068,9 @@ fn handle_edit_key(st: &mut BrowserState, press: KeyPress) -> Option<bool> {
             st.address_input.blur();
             let trimmed = typed.trim();
             if !trimmed.is_empty() {
-                let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://")
-                {
-                    trimmed.to_string()
-                } else {
-                    format!("https://{trimmed}")
-                };
-                match Url::parse(&candidate) {
-                    Ok(url) => st.navigate_active(&url),
-                    Err(e) => eprintln!("invalid URL {trimmed:?}: {e}"),
+                match address_entry_to_url(trimmed) {
+                    Some(url) => st.navigate_active(&url),
+                    None => eprintln!("could not resolve address {trimmed:?}"),
                 }
             }
             Some(true)
