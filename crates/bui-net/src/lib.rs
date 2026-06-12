@@ -16,6 +16,7 @@ pub use cookie::{Cookie, CookieJar, SameSite};
 pub use request::{Method, Request};
 pub use response::Response;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -49,6 +50,50 @@ pub enum NetError {
     ReadTimeout,
 }
 
+/// How long an idle pooled connection stays usable. Most origin
+/// servers / CDNs keep idle HTTP/1.1 connections open for 5-60s;
+/// a stale one just costs us one failed write and a retry.
+const POOL_IDLE_TTL: Duration = Duration::from_secs(30);
+/// Cap of idle connections kept per (host, port, tls) key.
+const POOL_MAX_IDLE_PER_KEY: usize = 4;
+
+/// A connected stream, plain or TLS, with its read buffer. The
+/// BufReader stays with the connection across requests so no buffered
+/// bytes are lost when it returns to the pool.
+enum PooledStream {
+    Plain(BufReader<TcpStream>),
+    Tls(BufReader<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl PooledStream {
+    async fn send_request(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            PooledStream::Plain(s) => {
+                s.write_all(bytes).await?;
+                s.flush().await
+            }
+            PooledStream::Tls(s) => {
+                s.write_all(bytes).await?;
+                s.flush().await
+            }
+        }
+    }
+
+    async fn read_response(&mut self) -> Result<(Response, bool), NetError> {
+        match self {
+            PooledStream::Plain(s) => Response::read_from_framed(s).await,
+            PooledStream::Tls(s) => Response::read_from_framed(s).await,
+        }
+    }
+}
+
+struct IdleConn {
+    stream: PooledStream,
+    since: std::time::Instant,
+}
+
+type PoolKey = (String, u16, bool); // host, port, tls
+
 pub struct Client {
     tls: Arc<rustls::ClientConfig>,
     pub user_agent: String,
@@ -58,6 +103,9 @@ pub struct Client {
     /// Per-process cookie jar. Reads happen on every request; writes
     /// happen on every Set-Cookie response.
     jar: Arc<Mutex<CookieJar>>,
+    /// Idle keep-alive connections by (host, port, tls). Sync mutex,
+    /// never held across an await.
+    pool: Arc<Mutex<HashMap<PoolKey, Vec<IdleConn>>>>,
 }
 
 impl Client {
@@ -80,6 +128,7 @@ impl Client {
             connect_timeout: Duration::from_secs(15),
             read_timeout: Duration::from_secs(60),
             jar: Arc::new(Mutex::new(CookieJar::new())),
+            pool: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -135,41 +184,104 @@ impl Client {
     async fn fetch_one(&self, req: &Request) -> Result<Response, NetError> {
         let host = req.url.host.clone();
         let port = req.url.effective_port();
-        let request_bytes = req.serialize();
+        let tls = req.url.scheme == "https";
+        let key: PoolKey = (host.clone(), port, tls);
+        // Only idempotent requests ride pooled connections: a stale
+        // keep-alive socket fails after the request was written, and
+        // re-sending a POST could double-submit.
+        let poolable = matches!(req.method, Method::Get | Method::Head)
+            && !req.has_header("connection");
+        let request_bytes = if poolable || req.has_header("connection") {
+            req.serialize()
+        } else {
+            req.clone().header("Connection", "close").serialize()
+        };
 
-        let tcp = timeout(
-            self.connect_timeout,
-            TcpStream::connect((host.as_str(), port)),
-        )
-        .await
-        .map_err(|_| NetError::ConnectTimeout)??;
+        // Reuse an idle connection when we have one. Failure here just
+        // means the server hung up while it sat in the pool — discard
+        // and fall through to a fresh connection.
+        if poolable {
+            while let Some(mut stream) = self.take_idle(&key) {
+                match self.roundtrip(&mut stream, &request_bytes).await {
+                    Ok((resp, framed)) => {
+                        if framed && response_keeps_alive(&resp) {
+                            self.put_idle(&key, stream);
+                        }
+                        return Ok(resp);
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        let mut stream = self.connect(&host, port, tls).await?;
+        let (resp, framed) = self.roundtrip(&mut stream, &request_bytes).await?;
+        if poolable && framed && response_keeps_alive(&resp) {
+            self.put_idle(&key, stream);
+        }
+        Ok(resp)
+    }
+
+    async fn connect(&self, host: &str, port: u16, tls: bool) -> Result<PooledStream, NetError> {
+        let tcp = timeout(self.connect_timeout, TcpStream::connect((host, port)))
+            .await
+            .map_err(|_| NetError::ConnectTimeout)??;
         let _ = tcp.set_nodelay(true);
-
-        let result = if req.url.scheme == "https" {
+        if tls {
             let connector = tokio_rustls::TlsConnector::from(self.tls.clone());
-            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-                .map_err(|_| NetError::InvalidServerName(host.clone()))?;
-            let mut stream = connector
+            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|_| NetError::InvalidServerName(host.to_string()))?;
+            let stream = connector
                 .connect(server_name, tcp)
                 .await
                 .map_err(|e| NetError::Tls(e.to_string()))?;
-            stream.write_all(&request_bytes).await?;
-            stream.flush().await?;
-            let mut reader = BufReader::new(stream);
-            timeout(self.read_timeout, Response::read_from(&mut reader))
-                .await
-                .map_err(|_| NetError::ReadTimeout)?
+            Ok(PooledStream::Tls(BufReader::new(stream)))
         } else {
-            let mut stream = tcp;
-            stream.write_all(&request_bytes).await?;
-            stream.flush().await?;
-            let mut reader = BufReader::new(stream);
-            timeout(self.read_timeout, Response::read_from(&mut reader))
-                .await
-                .map_err(|_| NetError::ReadTimeout)?
-        };
+            Ok(PooledStream::Plain(BufReader::new(tcp)))
+        }
+    }
 
-        result
+    async fn roundtrip(
+        &self,
+        stream: &mut PooledStream,
+        request_bytes: &[u8],
+    ) -> Result<(Response, bool), NetError> {
+        stream.send_request(request_bytes).await?;
+        timeout(self.read_timeout, stream.read_response())
+            .await
+            .map_err(|_| NetError::ReadTimeout)?
+    }
+
+    fn take_idle(&self, key: &PoolKey) -> Option<PooledStream> {
+        let mut pool = self.pool.lock().ok()?;
+        let conns = pool.get_mut(key)?;
+        conns.retain(|c| c.since.elapsed() < POOL_IDLE_TTL);
+        // Most recently parked first — it's the least likely to be stale.
+        conns.pop().map(|c| c.stream)
+    }
+
+    fn put_idle(&self, key: &PoolKey, stream: PooledStream) {
+        let Ok(mut pool) = self.pool.lock() else { return };
+        let conns = pool.entry(key.clone()).or_default();
+        conns.push(IdleConn {
+            stream,
+            since: std::time::Instant::now(),
+        });
+        if conns.len() > POOL_MAX_IDLE_PER_KEY {
+            conns.remove(0); // drop the oldest
+        }
+    }
+}
+
+/// Whether the server allows reusing the connection. No Connection
+/// header means persistent (the HTTP/1.1 default); an HTTP/1.0 server
+/// that closes anyway just costs the next request one stale-retry.
+fn response_keeps_alive(resp: &Response) -> bool {
+    match resp.header("connection") {
+        None => true,
+        Some(v) => !v
+            .split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("close")),
     }
 }
 

@@ -61,7 +61,6 @@ impl Request {
         let mut has_ua = false;
         let mut has_accept = false;
         let mut has_accept_encoding = false;
-        let mut has_connection = false;
         for (k, v) in &self.headers {
             if k.eq_ignore_ascii_case("host") {
                 continue;
@@ -74,9 +73,6 @@ impl Request {
             }
             if k.eq_ignore_ascii_case("accept-encoding") {
                 has_accept_encoding = true;
-            }
-            if k.eq_ignore_ascii_case("connection") {
-                has_connection = true;
             }
             let _ = write!(out, "{k}: {v}\r\n");
         }
@@ -92,10 +88,9 @@ impl Request {
             // Typically shrinks HTML/CSS/JS transfers 3-5x.
             out.extend_from_slice(b"Accept-Encoding: gzip\r\n");
         }
-        if !has_connection {
-            // Single-shot fetch — close after response. Keep-alive lands later.
-            out.extend_from_slice(b"Connection: close\r\n");
-        }
+        // No Connection default: HTTP/1.1 connections are persistent
+        // unless a side says otherwise. The Client adds `close` itself
+        // for requests it won't pool (e.g. POST).
 
         if let Some(body) = &self.body {
             let _ = write!(out, "Content-Length: {}\r\n", body.len());
@@ -119,7 +114,9 @@ mod tests {
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.starts_with("GET /foo?bar=1 HTTP/1.1\r\n"), "{s}");
         assert!(s.contains("Host: example.com\r\n"));
-        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.contains("Accept-Encoding: gzip\r\n"));
+        // Persistent by default (HTTP/1.1) — no Connection header.
+        assert!(!s.to_ascii_lowercase().contains("connection:"));
         assert!(s.ends_with("\r\n\r\n"));
     }
 

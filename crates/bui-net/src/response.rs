@@ -26,6 +26,16 @@ impl Response {
     }
 
     pub async fn read_from<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Self, NetError> {
+        Ok(Self::read_from_framed(reader).await?.0)
+    }
+
+    /// Like [`read_from`], but also reports whether the body had
+    /// explicit framing (content-length / chunked / bodiless status).
+    /// An unframed body is delimited by EOF, which means the
+    /// connection it came from cannot be reused.
+    pub(crate) async fn read_from_framed<R: AsyncBufRead + Unpin>(
+        reader: &mut R,
+    ) -> Result<(Self, bool), NetError> {
         let status_line = read_line(reader).await?;
         let (status, reason) = parse_status_line(&status_line)?;
 
@@ -50,15 +60,18 @@ impl Response {
             headers.push((name.trim().to_string(), value.trim().to_string()));
         }
 
-        let body = read_body(reader, &headers, status).await?;
+        let (body, framed) = read_body(reader, &headers, status).await?;
         let body = decode_content(body, &headers)?;
 
-        Ok(Response {
-            status,
-            reason,
-            headers,
-            body,
-        })
+        Ok((
+            Response {
+                status,
+                reason,
+                headers,
+                body,
+            },
+            framed,
+        ))
     }
 }
 
@@ -112,10 +125,10 @@ async fn read_body<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     headers: &[(String, String)],
     status: u16,
-) -> Result<Vec<u8>, NetError> {
+) -> Result<(Vec<u8>, bool), NetError> {
     // Some statuses must not include a body.
     if matches!(status, 204 | 304) || (100..200).contains(&status) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
 
     let transfer_encoding = header_lower(headers, "transfer-encoding");
@@ -124,7 +137,7 @@ async fn read_body<R: AsyncBufRead + Unpin>(
         .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("chunked")))
         .unwrap_or(false)
     {
-        return read_chunked(reader).await;
+        return Ok((read_chunked(reader).await?, true));
     }
 
     if let Some(len_str) = header_lower(headers, "content-length") {
@@ -134,13 +147,13 @@ async fn read_body<R: AsyncBufRead + Unpin>(
             .map_err(|_| NetError::MalformedHeader(format!("Content-Length: {len_str}")))?;
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf).await?;
-        return Ok(buf);
+        return Ok((buf, true));
     }
 
     // No framing — read until EOF (Connection: close case).
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).await?;
-    Ok(buf)
+    Ok((buf, false))
 }
 
 async fn read_chunked<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, NetError> {
