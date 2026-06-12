@@ -20,6 +20,7 @@
 //!     ⌘[          back   (uses per-tab history)
 //!     ⌘]          forward
 //!     ⌘⇧T         reopen most recently closed tab
+//!     ⌘U          check for updates / restart into a staged update
 
 mod address_input;
 mod start_page;
@@ -33,6 +34,7 @@ use bui_layout::LayoutBox;
 use bui_net::{Client, Url};
 use bui_paint::{Color, DisplayList, PaintCommand, Rect};
 use bui_shell::{App, CursorIcon, Key, KeyPress, Viewport};
+use bui_update::{SharedUpdateStatus, UpdateStatus};
 
 // ----- Copper paper palette (see design/Design Plan.html §03) -----
 // Warm paper background, dark ink, single copper accent. The names match
@@ -1656,6 +1658,13 @@ struct BrowserState {
     dock_open: bool,
     /// Currently-active dock viewer.
     active_dock_tab: DockTab,
+    /// Auto-updater state, written by the background check thread and
+    /// read each frame for the status-line pill. Separate mutex from
+    /// BrowserState so the worker never contends with frame painting.
+    update: SharedUpdateStatus,
+    /// Wakes the event loop from background threads. Set once in
+    /// `on_proxy` before the loop starts; manual ⌘U re-checks use it.
+    redrawer: Option<bui_shell::Redrawer>,
 }
 
 /// Dev-dock panel selector. The dock is always one of three live
@@ -1692,6 +1701,8 @@ impl BrowserState {
             sidebar_open: true,
             dock_open: false,
             active_dock_tab: DockTab::Xhr,
+            update: bui_update::new_shared_status(),
+            redrawer: None,
         }
     }
 
@@ -1761,7 +1772,25 @@ impl BrowserState {
     }
 }
 
+/// Version of the running binary, for comparing against release tags.
+fn current_version() -> bui_update::Version {
+    bui_update::Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION parses")
+}
+
+/// Kick off a background update check; progress lands in `st.update`
+/// and each transition wakes the event loop through the redrawer.
+fn start_update_check(st: &BrowserState, delay: std::time::Duration) {
+    let update = st.update.clone();
+    match st.redrawer.clone() {
+        Some(r) => bui_update::spawn_check(update, current_version(), move || r.request_redraw(), delay),
+        // No redrawer yet (shouldn't happen after startup) — results
+        // still land in the shared status, just without a wakeup.
+        None => bui_update::spawn_check(update, current_version(), || {}, delay),
+    }
+}
+
 fn run_browser(initial_url: &str) -> ExitCode {
+    bui_update::cleanup_stale();
     let url = match Url::parse(initial_url) {
         Ok(u) => u,
         Err(e) => {
@@ -1787,6 +1816,7 @@ fn run_browser(initial_url: &str) -> ExitCode {
     let drag_state = state.clone();
     let mouse_up_state = state.clone();
     let right_click_state = state.clone();
+    let proxy_state = state.clone();
 
     App::new(move |viewport| build_scene(viewport, &render_state))
         .with_title(app_title)
@@ -1803,6 +1833,13 @@ fn run_browser(initial_url: &str) -> ExitCode {
         })
         .on_key(move |press| handle_key(&key_state, press))
         .on_cursor(move |viewport| cursor_for(&cursor_state, viewport))
+        .on_proxy(move |redrawer| {
+            let mut st = proxy_state.lock().unwrap();
+            st.redrawer = Some(redrawer);
+            // Startup check, delayed so first paint + page load win the
+            // network race.
+            start_update_check(&st, std::time::Duration::from_secs(5));
+        })
         .run()
         .expect("event loop");
     ExitCode::SUCCESS
@@ -2227,7 +2264,8 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
             0
         }
     };
-    paint_status(w, h, &active_url, scroll_pct, &mut dl);
+    let update_status = st.update.lock().unwrap().clone();
+    paint_status(w, h, &active_url, scroll_pct, &update_status, &mut dl);
     dl
 }
 
@@ -3010,7 +3048,49 @@ fn build_empty_body_fallback(viewport_w_px: f32, _url: &str) -> DisplayList {
     dl
 }
 
-fn paint_status(width: f32, height: f32, url: &str, scroll_pct: u32, dl: &mut DisplayList) {
+/// Status-line label for the updater, or None when there's nothing to
+/// show. The bool marks actionable states (painted as a pill, clickable).
+fn update_status_text(status: &UpdateStatus) -> Option<(String, bool)> {
+    if status.is_expired() {
+        return None;
+    }
+    match status {
+        UpdateStatus::Idle => None,
+        UpdateStatus::Checking => Some(("checking for updates...".into(), false)),
+        UpdateStatus::UpToDate { .. } => Some(("up to date".into(), false)),
+        UpdateStatus::Downloading { version } => Some((format!("downloading v{version}..."), false)),
+        UpdateStatus::Ready(staged) => {
+            Some((format!("restart to update v{} (cmd+U)", staged.version), true))
+        }
+        UpdateStatus::AvailableNotWritable { version, .. } => {
+            Some((format!("v{version} available - open releases"), true))
+        }
+        UpdateStatus::Failed { .. } => Some(("update check failed".into(), false)),
+    }
+}
+
+/// Shared paint + hit-test rect for the update pill: right-aligned in
+/// the status line, left of the scroll % readout.
+fn update_status_rect(width: f32, height: f32, label: &str) -> Rect {
+    let font = bui_text::shared_font();
+    let pill_w = font.measure_text(label, 10.5) + 14.0;
+    let scroll_reserve = font.measure_text("scroll 100%", 10.5) + 24.0;
+    Rect::new(
+        width - scroll_reserve - pill_w - 8.0,
+        height - STATUS_HEIGHT + 4.0,
+        pill_w,
+        STATUS_HEIGHT - 8.0,
+    )
+}
+
+fn paint_status(
+    width: f32,
+    height: f32,
+    url: &str,
+    scroll_pct: u32,
+    update: &UpdateStatus,
+    dl: &mut DisplayList,
+) {
     let y = height - STATUS_HEIGHT;
     if y <= 0.0 {
         return;
@@ -3062,6 +3142,27 @@ fn paint_status(width: f32, height: f32, url: &str, scroll_pct: u32, dl: &mut Di
         color: STATUS_INK,
         content: right_text,
     });
+
+    // Update pill, left of the scroll readout. Actionable states get a
+    // copper pill like the NORMAL badge; passive ones render as ink.
+    if let Some((label, actionable)) = update_status_text(update) {
+        let r = update_status_rect(width, height, &label);
+        let advance = font.measure_text(&label, 10.5);
+        let color = if actionable {
+            dl.fill_rounded_rect(r, COPPER, [3.0; 4]);
+            Color::WHITE
+        } else {
+            STATUS_INK
+        };
+        dl.commands.push(PaintCommand::Text {
+            x: r.x + (r.w - advance) / 2.0,
+            baseline,
+            advance,
+            font_size: 10.5,
+            color,
+            content: label,
+        });
+    }
 }
 
 fn paint_chrome(
@@ -3664,6 +3765,14 @@ fn cursor_for(state: &Arc<Mutex<BrowserState>>, viewport: Viewport) -> CursorIco
         return CursorIcon::Default;
     }
     if cy >= viewport.height as f32 - STATUS_HEIGHT {
+        // Pointer over an actionable update pill.
+        let status = st.update.lock().unwrap().clone();
+        if let Some((label, true)) = update_status_text(&status) {
+            let r = update_status_rect(viewport.width as f32, viewport.height as f32, &label);
+            if rect_contains(r, (cx, cy)) {
+                return CursorIcon::Pointer;
+            }
+        }
         return CursorIcon::Default;
     }
     let scroll_y = st.active_tab().scroll_y;
@@ -3804,6 +3913,17 @@ fn handle_click(
         if st.address_input.focused {
             st.address_input.blur();
             return true;
+        }
+        return false;
+    }
+    // Status line — only the update pill is clickable there.
+    if y >= viewport.height as f32 - STATUS_HEIGHT {
+        let status = st.update.lock().unwrap().clone();
+        if let Some((label, true)) = update_status_text(&status) {
+            let r = update_status_rect(viewport.width as f32, viewport.height as f32, &label);
+            if rect_contains(r, (x, y)) {
+                return trigger_update_action(&mut st);
+            }
         }
         return false;
     }
@@ -4766,6 +4886,37 @@ fn handle_key(state: &Arc<Mutex<BrowserState>>, press: KeyPress) -> bool {
         Some('9') => {
             let last = st.tabs.len().saturating_sub(1);
             st.switch_to(last);
+            true
+        }
+        // ⌘U — update. Staged → restart into it; not writable → open the
+        // release page; otherwise start a manual check.
+        Some('u') => {
+            if !trigger_update_action(&mut st) {
+                start_update_check(&st, std::time::Duration::ZERO);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Act on the current update state: restart into a staged binary or
+/// open the release page when we can't self-install. Returns false when
+/// there's nothing actionable (caller may start a check instead).
+fn trigger_update_action(st: &mut BrowserState) -> bool {
+    let status = st.update.lock().unwrap().clone();
+    match status {
+        UpdateStatus::Ready(staged) => {
+            // Returns only on failure; success exits into the new binary.
+            let err = bui_update::apply_and_relaunch(&staged);
+            *st.update.lock().unwrap() = UpdateStatus::Failed {
+                msg: err.to_string(),
+                at: std::time::Instant::now(),
+            };
+            true
+        }
+        UpdateStatus::AvailableNotWritable { html_url, .. } => {
+            st.open_tab(&html_url);
             true
         }
         _ => false,

@@ -201,6 +201,7 @@ dependencies = [
  "bui-shell",
  "bui-style",
  "bui-text",
+ "bui-update",
  "bui-url",
  "tokio",
 ]
@@ -307,6 +308,16 @@ version = "0.1.0"
 dependencies = [
  "peniko",
  "skrifa",
+]
+
+[[package]]
+name = "bui-update"
+version = "0.1.0"
+dependencies = [
+ "bui-net",
+ "bui-url",
+ "ring",
+ "tokio",
 ]
 
 [[package]]

@@ -73,6 +73,19 @@ pub enum CursorIcon {
     Progress,
 }
 
+/// Cloneable, thread-safe handle that wakes the event loop and schedules
+/// a repaint. Background work (e.g. the updater thread) holds one so a
+/// state change becomes visible without waiting for the next input event.
+#[derive(Clone)]
+pub struct Redrawer(winit::event_loop::EventLoopProxy<()>);
+
+impl Redrawer {
+    pub fn request_redraw(&self) {
+        // Err only when the event loop is gone (shutdown) — nothing to do.
+        let _ = self.0.send_event(());
+    }
+}
+
 pub type SceneFn = Box<dyn FnMut(Viewport) -> DisplayList>;
 pub type ClickFn = Box<dyn FnMut(Viewport, f32, f32, Modifiers) -> bool>;
 pub type ScrollFn = Box<dyn FnMut(f32) -> bool>;
@@ -104,6 +117,7 @@ pub struct App {
     on_drag: Option<DragFn>,
     on_mouse_up: Option<MouseUpFn>,
     on_right_click: Option<RightClickFn>,
+    on_proxy: Option<Box<dyn FnOnce(Redrawer)>>,
     title: String,
     initial_size: (u32, u32),
     modifiers: Modifiers,
@@ -137,6 +151,7 @@ impl App {
             on_drag: None,
             on_mouse_up: None,
             on_right_click: None,
+            on_proxy: None,
             title: "bui".to_string(),
             initial_size: (1280, 800),
             modifiers: Modifiers::default(),
@@ -233,8 +248,23 @@ impl App {
         self
     }
 
+    /// `f(redrawer)` runs once before the event loop starts, handing the
+    /// binary a [`Redrawer`] it can move onto background threads.
+    pub fn on_proxy<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(Redrawer) + 'static,
+    {
+        self.on_proxy = Some(Box::new(f));
+        self
+    }
+
     pub fn run(mut self) -> Result<(), winit::error::EventLoopError> {
-        let event_loop = EventLoop::new().expect("event loop");
+        let event_loop = EventLoop::<()>::with_user_event()
+            .build()
+            .expect("event loop");
+        if let Some(f) = self.on_proxy.take() {
+            f(Redrawer(event_loop.create_proxy()));
+        }
         event_loop.run_app(&mut self)
     }
 }
@@ -313,6 +343,14 @@ fn modifiers_from_state(state: ModifiersState) -> Modifiers {
 }
 
 impl ApplicationHandler for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        // Sent by a Redrawer from a background thread: schedule a repaint
+        // so state changes (e.g. update progress) become visible.
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;

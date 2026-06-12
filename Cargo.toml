@@ -14,6 +14,7 @@ members = [
     "crates/bui-gpu",
     "crates/bui-js",
     "crates/bui-shell",
+    "crates/bui-update",
     "crates/bui",
 ]
 

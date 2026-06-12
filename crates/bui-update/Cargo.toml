@@ -1,0 +1,16 @@
+[package]
+name = "bui-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bui-net = { path = "../bui-net" }
+bui-url = { path = "../bui-url" }
+# Already in the tree via rustls — used only for SHA-256.
+ring = "0.17"
+tokio = { version = "1", features = ["rt", "time"] }
+
+[lints]
+workspace = true
