@@ -25,7 +25,7 @@ bui-style = { path = "../bui-style" }
 bui-text = { path = "../bui-text" }
 bui-update = { path = "../bui-update" }
 bui-url = { path = "../bui-url" }
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]
 workspace = true

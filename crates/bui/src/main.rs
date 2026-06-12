@@ -196,7 +196,12 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 
 fn shared_runtime() -> &'static tokio::runtime::Runtime {
     SHARED_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
+        // Multi-thread flavor so the IO driver runs on background
+        // workers: the UI thread and page-loader threads can block_on
+        // concurrently, and pooled bui-net sockets (registered with
+        // this runtime's reactor) stay usable from any thread.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("build tokio runtime")
@@ -455,6 +460,14 @@ fn run_layout_debug(url_str: &str, viewport_w: f32, grep: Option<&str>) -> ExitC
     ExitCode::SUCCESS
 }
 
+/// One stylesheet's origin, recorded in document order so the cascade
+/// priority survives fetching remote sheets out of order (in parallel,
+/// possibly on a loader thread).
+enum SheetSource {
+    Inline(String),
+    Remote(Url),
+}
+
 /// Walk the document in tree order, picking up author stylesheets from
 /// both `<style>` blocks (parsed inline) and `<link rel="stylesheet">`
 /// elements (fetched + parsed). Tree order matters for the cascade:
@@ -463,6 +476,13 @@ fn collect_author_stylesheets(
     base: &Url,
     doc: &bui_dom::Document,
 ) -> Vec<bui_css::Stylesheet> {
+    let sources = collect_sheet_sources(base, doc);
+    resolve_sheet_sources(base, sources)
+}
+
+/// Tree-order walk picking up inline `<style>` text and `<link>` URLs.
+/// No network — the result is plain data a loader thread can resolve.
+fn collect_sheet_sources(base: &Url, doc: &bui_dom::Document) -> Vec<SheetSource> {
     fn has_noscript_ancestor(doc: &bui_dom::Document, nid: bui_dom::NodeId) -> bool {
         let mut cur = doc.node(nid).parent;
         while let Some(p) = cur {
@@ -516,14 +536,8 @@ fn collect_author_stylesheets(
         }
         false
     }
-    /// One stylesheet's origin, recorded in document order so the
-    /// cascade priority survives the parallel fetch below.
-    enum SheetSource {
-        Inline(String),
-        Remote(Url),
-    }
-    let mut sources: Vec<SheetSource> = Vec::new();
     let internal = base.is_internal();
+    let mut sources: Vec<SheetSource> = Vec::new();
     for nid in doc.descendants(doc.root) {
         let Some(elem) = doc.element(nid) else {
             continue;
@@ -596,7 +610,14 @@ fn collect_author_stylesheets(
             _ => {}
         }
     }
+    sources
+}
 
+/// Fetch + parse the collected sheet sources, preserving document
+/// order. Does network I/O via `shared_runtime().block_on` — call it
+/// from a plain thread (UI or loader), never from inside async code.
+fn resolve_sheet_sources(base: &Url, sources: Vec<SheetSource>) -> Vec<bui_css::Stylesheet> {
+    let internal = base.is_internal();
     // Fetch all remote sheets concurrently (they used to go one-by-one,
     // paying a full TLS round-trip each). Results come back keyed by
     // their position in `sources` so document order is preserved.
@@ -833,20 +854,30 @@ fn preload_images(
     base: &Url,
     doc: &bui_dom::Document,
 ) -> (bui_layout::ImageRegistry, bui_layout::SvgRegistry) {
-    let mut images = bui_layout::ImageRegistry::new();
-    let mut svgs = bui_layout::SvgRegistry::new();
-    if base.is_internal() {
-        // copper:// pages don't load remote resources.
-        return (images, svgs);
+    let (by_url, unique_urls) = collect_image_urls(base, doc);
+    if by_url.is_empty() {
+        return (bui_layout::ImageRegistry::new(), bui_layout::SvgRegistry::new());
     }
+    let results = fetch_image_resources(unique_urls);
+    build_image_registries(results, &by_url)
+}
 
-    // Pass 1: collect all <img> nodes + their resolved URL. Build a
-    // URL → Vec<NodeId> map so the same image referenced by multiple
-    // <img> tags only triggers one network fetch.
+/// Pass 1: collect all <img> nodes + their resolved URL. Builds a
+/// URL → Vec<NodeId> map so the same image referenced by multiple
+/// <img> tags only triggers one network fetch. No network — a loader
+/// thread can take the URL list from here.
+fn collect_image_urls(
+    base: &Url,
+    doc: &bui_dom::Document,
+) -> (std::collections::HashMap<String, Vec<bui_dom::NodeId>>, Vec<Url>) {
     let mut by_url: std::collections::HashMap<String, Vec<bui_dom::NodeId>> =
         std::collections::HashMap::new();
     let mut url_for_key: std::collections::HashMap<String, Url> =
         std::collections::HashMap::new();
+    if base.is_internal() {
+        // copper:// pages don't load remote resources.
+        return (by_url, Vec::new());
+    }
     for node in doc.descendants(doc.root) {
         let Some(elem) = doc.element(node) else { continue };
         if elem.name != "img" {
@@ -861,12 +892,14 @@ fn preload_images(
         by_url.entry(key.clone()).or_default().push(node);
         url_for_key.entry(key).or_insert(img_url);
     }
-    if by_url.is_empty() {
-        return (images, svgs);
-    }
     let unique_urls: Vec<Url> = url_for_key.into_values().collect();
+    (by_url, unique_urls)
+}
 
-    // Pass 2: fetch all unique URLs concurrently, with a small
+/// Pass 2: fetch + decode unique image URLs. Blocking
+/// (`shared_runtime().block_on`) — call from a plain thread.
+fn fetch_image_resources(unique_urls: Vec<Url>) -> Vec<(String, Option<ImageResource>)> {
+    // Fetch all unique URLs concurrently, with a small
     // semaphore so a 80-image page doesn't slam Wikimedia all at once
     // (which is exactly what was triggering the 429 cliff before).
     let results: Vec<(String, Option<ImageResource>)> = shared_runtime().block_on(async {
@@ -889,8 +922,17 @@ fn preload_images(
         }
         out
     });
+    results
+}
 
-    // Pass 3: distribute results to every node that referenced the URL.
+/// Pass 3: distribute fetched resources to every node that referenced
+/// each URL and queue raster pixels for GPU upload. UI thread.
+fn build_image_registries(
+    results: Vec<(String, Option<ImageResource>)>,
+    by_url: &std::collections::HashMap<String, Vec<bui_dom::NodeId>>,
+) -> (bui_layout::ImageRegistry, bui_layout::SvgRegistry) {
+    let mut images = bui_layout::ImageRegistry::new();
+    let mut svgs = bui_layout::SvgRegistry::new();
     for (key, res) in results {
         let Some(nodes) = by_url.get(&key) else { continue };
         match res {
@@ -1065,8 +1107,22 @@ fn parse_svg_bytes(bytes: &[u8]) -> Option<bui_layout::SvgEntry> {
 /// once. Sites that point at a non-existent / non-image URL just
 /// silently miss the cache and paint without a background.
 fn resolve_and_preload_background_images(base: &Url, style: &mut bui_style::StyleTree) {
-    if base.is_internal() {
+    let to_fetch = resolve_background_image_keys(base, style);
+    if to_fetch.is_empty() {
         return;
+    }
+    let fetched = fetch_background_images(to_fetch);
+    for (key, image) in fetched {
+        bui_gpu::enqueue_upload(key, image);
+    }
+}
+
+/// Rewrite each `background-image` value to its absolute URL (the GPU
+/// upload-cache key paint will use) and return the unique URLs that
+/// still need fetching. No network — UI thread.
+fn resolve_background_image_keys(base: &Url, style: &mut bui_style::StyleTree) -> Vec<Url> {
+    if base.is_internal() {
+        return Vec::new();
     }
     let mut to_fetch: Vec<Url> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1087,9 +1143,12 @@ fn resolve_and_preload_background_images(base: &Url, style: &mut bui_style::Styl
             }
         }
     }
-    if to_fetch.is_empty() {
-        return;
-    }
+    to_fetch
+}
+
+/// Fetch + decode background images. Blocking — call from a plain
+/// thread; the caller queues the pixels for GPU upload.
+fn fetch_background_images(to_fetch: Vec<Url>) -> Vec<(String, bui_image::Image)> {
     // Concurrent fetches with the same in-flight cap the <img> preload
     // path uses — these used to download one-by-one.
     let fetched: Vec<(String, Option<bui_image::Image>)> = shared_runtime().block_on(async {
@@ -1112,11 +1171,10 @@ fn resolve_and_preload_background_images(base: &Url, style: &mut bui_style::Styl
         }
         out
     });
-    for (key, image) in fetched {
-        if let Some(image) = image {
-            bui_gpu::enqueue_upload(key, image);
-        }
-    }
+    fetched
+        .into_iter()
+        .filter_map(|(key, image)| image.map(|i| (key, i)))
+        .collect()
 }
 
 fn fetch_and_decode_image(url: &Url) -> Option<bui_image::Image> {
@@ -1214,17 +1272,23 @@ fn find_favicon_href(doc: &bui_dom::Document) -> Option<String> {
 /// — returns `None`, and the chrome just shows no icon. Internal pages
 /// (start page, etc.) never carry a favicon.
 fn load_favicon(base: &Url, declared_href: Option<String>) -> Option<String> {
-    if base.is_internal() {
-        return None;
-    }
-    let url = match declared_href {
-        Some(href) => base.join(&href).ok()?,
-        None => base.join("/favicon.ico").ok()?,
-    };
+    let url = favicon_fetch_url(base, declared_href)?;
     let key = url.to_string();
     let image = fetch_and_decode_image(&url)?;
     bui_gpu::enqueue_upload(key.clone(), image);
     Some(key)
+}
+
+/// Absolute favicon URL for a page: the declared `<link>` href when
+/// present, else the `/favicon.ico` convention. None for internal pages.
+fn favicon_fetch_url(base: &Url, declared_href: Option<String>) -> Option<Url> {
+    if base.is_internal() {
+        return None;
+    }
+    match declared_href {
+        Some(href) => base.join(&href).ok(),
+        None => base.join("/favicon.ico").ok(),
+    }
 }
 
 /// Rasterise an SVG into a small RGBA8 buffer suitable for the
@@ -1254,6 +1318,125 @@ fn rasterize_svg_for_background(entry: bui_layout::SvgEntry) -> bui_image::Image
         height: h,
         pixels,
     }
+}
+
+// ---- page-load pipeline pieces ----
+//
+// A load splits at the JS boundary: network stages (HTML, stylesheets,
+// images, favicon) are plain data and run on loader threads; parsing,
+// script execution, and styling stay on the UI thread because the Zinc
+// JsContext holds JIT executable memory and is !Send. Sync callers
+// (TabState::fetch — CLI paths, internal pages) compose the same
+// pieces back-to-back.
+
+/// Fetch a page's HTML (lossy UTF-8). Blocking
+/// (`shared_runtime().block_on`) — call from a plain thread.
+fn fetch_html_text(url: &Url) -> Result<String, String> {
+    if url.is_internal() {
+        return start_page::html_for(&url.host)
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("no internal page for {url}"));
+    }
+    let started = std::time::Instant::now();
+    let resp = shared_runtime()
+        .block_on(shared_client().get(url))
+        .map_err(|e| {
+            net_record("GET", url, 0, started.elapsed().as_millis() as u32, 0);
+            format!("{e}")
+        })?;
+    let ms = started.elapsed().as_millis() as u32;
+    net_record("GET", url, resp.status, ms, resp.body.len());
+    // Servers like google.com still send ISO-8859-1 / Windows-1252;
+    // declare charset support in the Content-Type but emit non-UTF-8
+    // bytes mid-stream. We use lossy decoding so a single weird byte
+    // doesn't take down the whole navigation. A proper Content-Type
+    // charset → decoder mapping is the right follow-up.
+    Ok(String::from_utf8_lossy(&resp.body).into_owned())
+}
+
+/// Parsed document + live JS engine for a page, before styles and
+/// resources are resolved. UI-thread only (JsContext is !Send).
+struct BootedPage {
+    doc: Arc<Mutex<bui_dom::Document>>,
+    js_ctx: bui_js::JsContext,
+    console_log: Vec<String>,
+    /// Set when a boot-time script assigned `location.href` to a
+    /// different page — the load must restart at that URL.
+    redirect: Option<Url>,
+}
+
+/// Parse `html` and run inline scripts against the live DOM.
+fn boot_page(url: &Url, html: &str) -> BootedPage {
+    let doc = Arc::new(Mutex::new(bui_html::parse(html)));
+    let mut console_log: Vec<String> = Vec::new();
+    // Synchronous fetcher backing JS-side `fetch(url, opts)`.
+    // Resolves the URL against the page's base (so a script
+    // calling `fetch('/api/x')` lands on the same host), then
+    // does a blocking GET via the shared client. Recorded into
+    // NET_CAPTURE so the dev-dock XHR tab shows the request.
+    let base_url = url.clone();
+    let fetcher: bui_js::Fetcher = std::sync::Arc::new(move |raw: &str| {
+        let resolved = base_url.join(raw).ok()?;
+        let started = std::time::Instant::now();
+        let resp = shared_runtime()
+            .block_on(shared_client().get(&resolved))
+            .ok()?;
+        let ms = started.elapsed().as_millis() as u32;
+        net_record("GET", &resolved, resp.status, ms, resp.body.len());
+        Some(bui_js::FetchResponse {
+            status: resp.status,
+            url: resolved.to_string(),
+            body: resp.body,
+        })
+    });
+    let (mut js_ctx, outcomes) = bui_js::JsContext::install_and_run(
+        doc.clone(),
+        url.to_string(),
+        Some(fetcher),
+    );
+    for outcome in outcomes {
+        for line in &outcome.output {
+            eprintln!("[js] {line}");
+            console_log.push(line.clone());
+        }
+    }
+    // The synthetic `load` event fires inside install_and_run;
+    // anything its handlers logged or threw lands in the
+    // context's post-load buffer. Drain it now so the
+    // dev-dock Console reflects everything that ran during
+    // page bootstrap, not just the inline-script pass.
+    for line in js_ctx.take_console_lines() {
+        eprintln!("[js] {line}");
+        console_log.push(line);
+    }
+    // A script may have set `window.location.href` — surface it so
+    // the caller can restart the load at the new URL.
+    let redirect = js_ctx.take_pending_navigation().and_then(|target| {
+        url.join(&target)
+            .ok()
+            .filter(|next| next.to_string() != url.to_string())
+    });
+    // Clear the dirty flag too — bindings tripped it during
+    // the script pass, but the layout built from this page
+    // already reflects every mutation. The next dispatch
+    // (from user input) will set it again if a handler
+    // mutates the DOM and the orchestrator will re-layout.
+    let _ = js_ctx.take_dirty();
+    BootedPage {
+        doc,
+        js_ctx,
+        console_log,
+        redirect,
+    }
+}
+
+/// Monotonic tab identity — stable across Vec reshuffles when tabs
+/// close, so async load results can find their tab (or detect it's
+/// gone).
+static NEXT_TAB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn fresh_tab_id() -> u64 {
+    NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 // ---- per-tab state ----
@@ -1309,6 +1492,9 @@ fn clear_net_capture() {
 }
 
 struct TabState {
+    /// Stable identity (see [`fresh_tab_id`]); survives page
+    /// navigations within the tab, unlike the Vec index.
+    tab_id: u64,
     title: String,
     url: Url,
     /// HTTP fetches recorded during this tab's load — drained from
@@ -1391,114 +1577,76 @@ impl TabState {
         // Google's modern /search page is a JS-required shell:
         // without scripts the body is wiped by a `<noscript>`
         // stylesheet that hides every table/div/span/p, plus a
-        // meta-refresh to a JS-only retry endpoint. Append
-        // `gbv=1` (Google's "basic HTML" version) so we land on
-        // the legacy results page that still works without JS.
-        // Same trick for `/imghp` etc isn't worth it; only the
-        // text-search submit path matters.
+        // meta-refresh to a JS-only retry endpoint. See
+        // maybe_rewrite_google_search for the state of that story.
         let url = maybe_rewrite_google_search(url);
         let url = &url;
         // Fresh net-capture for this navigation; descendant fetches
         // (stylesheets, images) append into the same global buffer.
         clear_net_capture();
-        let mut console_log: Vec<String> = Vec::new();
-        let html = if url.is_internal() {
-            start_page::html_for(&url.host)
-                .ok_or_else(|| format!("no internal page for {url}"))?
-                .to_string()
-        } else {
-            let started = std::time::Instant::now();
-            let resp = shared_runtime()
-                .block_on(shared_client().get(url))
-                .map_err(|e| {
-                    net_record("GET", url, 0, started.elapsed().as_millis() as u32, 0);
-                    format!("{e}")
-                })?;
-            let ms = started.elapsed().as_millis() as u32;
-            net_record("GET", url, resp.status, ms, resp.body.len());
-            // Servers like google.com still send ISO-8859-1 / Windows-1252;
-            // declare charset support in the Content-Type but emit non-UTF-8
-            // bytes mid-stream. We use lossy decoding so a single weird byte
-            // doesn't take down the whole navigation. A proper Content-Type
-            // charset → decoder mapping is the right follow-up.
-            String::from_utf8_lossy(&resp.body).into_owned()
+        let html = fetch_html_text(url)?;
+        let booted = boot_page(url, &html);
+        // If a boot script set `window.location.href`, follow the
+        // redirect by recursing once into `TabState::fetch`; chains
+        // bound themselves by call depth.
+        if let Some(next_url) = booted.redirect.clone() {
+            return TabState::fetch(&next_url);
+        }
+        let (sources, (img_by_url, img_urls), favicon_href) = {
+            let d = booted.doc.lock().unwrap();
+            (
+                collect_sheet_sources(url, &d),
+                collect_image_urls(url, &d),
+                find_favicon_href(&d),
+            )
         };
-        let doc = Arc::new(Mutex::new(bui_html::parse(&html)));
-        // Run inline <script> against a live, populated DOM. Bindings
-        // can now mutate (setAttribute, appendChild, createElement,
-        // classList, …) — the second tuple element is a `dirty`
-        // hint signalling whether any binding actually changed the
-        // tree. We always rebuild style + layout from `doc`
-        // immediately below so the hint is informational only at
-        // fetch time; it'll be load-bearing once timers / events
-        // fire scripts AFTER the initial layout.
-        // Synchronous fetcher backing JS-side `fetch(url, opts)`.
-        // Resolves the URL against the page's base (so a script
-        // calling `fetch('/api/x')` lands on the same host), then
-        // does a blocking GET via the shared client. Recorded into
-        // NET_CAPTURE so the dev-dock XHR tab shows the request.
-        let base_url = url.clone();
-        let fetcher: bui_js::Fetcher = std::sync::Arc::new(move |raw: &str| {
-            let resolved = base_url.join(raw).ok()?;
-            let started = std::time::Instant::now();
-            let resp = shared_runtime()
-                .block_on(shared_client().get(&resolved))
-                .ok()?;
-            let ms = started.elapsed().as_millis() as u32;
-            net_record("GET", &resolved, resp.status, ms, resp.body.len());
-            Some(bui_js::FetchResponse {
-                status: resp.status,
-                url: resolved.to_string(),
-                body: resp.body,
-            })
-        });
-        let (mut js_ctx, outcomes) = bui_js::JsContext::install_and_run(
-            doc.clone(),
-            url.to_string(),
-            Some(fetcher),
+        let sheets = resolve_sheet_sources(url, sources);
+        let (images, svgs) = build_image_registries(fetch_image_resources(img_urls), &img_by_url);
+        let favicon_key = load_favicon(url, favicon_href);
+        let (mut tab, bg_urls) = TabState::finalize(
+            url,
+            &html,
+            booted,
+            &sheets,
+            images,
+            svgs,
+            favicon_key,
         );
-        for outcome in outcomes {
-            for line in &outcome.output {
-                eprintln!("[js] {line}");
-                console_log.push(line.clone());
+        if !bg_urls.is_empty() {
+            for (key, image) in fetch_background_images(bg_urls) {
+                bui_gpu::enqueue_upload(key, image);
             }
+            // The bg fetches landed after finalize drained the net
+            // capture — pick them up so the dock waterfall is complete.
+            tab.net_log.extend(drain_net_capture());
         }
-        // The synthetic `load` event fires inside install_and_run;
-        // anything its handlers logged or threw lands in the
-        // context's post-load buffer. Drain it now so the
-        // dev-dock Console reflects everything that ran during
-        // page bootstrap, not just the inline-script pass.
-        for line in js_ctx.take_console_lines() {
-            eprintln!("[js] {line}");
-            console_log.push(line);
-        }
-        // If a script set `window.location.href`, resolve it against
-        // the current URL and follow the redirect by recursing once
-        // into `TabState::fetch`. One-shot: the recursion's own
-        // pending-nav drain handles a chain, capped only by the
-        // server / cookie state (we don't loop forever in this
-        // function — recursion bounds itself by call depth).
-        if let Some(target) = js_ctx.take_pending_navigation() {
-            if let Ok(next_url) = url.join(&target) {
-                if next_url.to_string() != url.to_string() {
-                    return TabState::fetch(&next_url);
-                }
-            }
-        }
-        // Clear the dirty flag too — bindings tripped it during
-        // the script pass, but the layout we're about to build
-        // already reflects every mutation. The next dispatch
-        // (from user input) will set it again if a handler
-        // mutates the DOM and the orchestrator will re-layout.
-        let _ = js_ctx.take_dirty();
+        Ok(tab)
+    }
+
+    /// Assemble the final TabState from a booted page and its fetched
+    /// resources. CPU only (style + DOM walks); also returns any
+    /// background-image URLs that still need fetching — they're
+    /// paint-only, so they may arrive after first layout.
+    fn finalize(
+        url: &Url,
+        html: &str,
+        booted: BootedPage,
+        sheets: &[bui_css::Stylesheet],
+        images: bui_layout::ImageRegistry,
+        svgs: bui_layout::SvgRegistry,
+        favicon_key: Option<String>,
+    ) -> (TabState, Vec<Url>) {
+        let BootedPage {
+            doc,
+            js_ctx,
+            console_log,
+            redirect: _,
+        } = booted;
         let dlocked = doc.lock().unwrap();
-        let sheets = collect_author_stylesheets(url, &dlocked);
-        let mut style = bui_style::style_document(&dlocked, &sheets);
-        // Resolve and pre-fetch any author-declared background-image
-        // URLs. This rewrites style.values in place so paint can use
-        // each background_image string directly as the upload-cache
-        // key.
-        resolve_and_preload_background_images(url, &mut style);
+        let mut style = bui_style::style_document(&dlocked, sheets);
+        // Rewrite background-image values to absolute upload-cache
+        // keys; the actual pixels can stream in later.
+        let bg_urls = resolve_background_image_keys(url, &mut style);
         let body_node = dlocked
             .descendants(dlocked.root)
             .find(|id| {
@@ -1523,12 +1671,6 @@ impl TabState {
                 }
             })
             .unwrap_or_else(|| url.host.clone());
-        let (images, svgs) = preload_images(&url, &dlocked);
-        // Read the favicon href while the doc is locked; the actual
-        // fetch/decode happens after we drop the lock (below) so we
-        // don't hold it across network I/O.
-        let favicon_href = find_favicon_href(&dlocked);
-
         // HTML autofocus: if any <input>/<textarea> on the page
         // declares the autofocus attribute, focus it on first
         // render so the user can start typing immediately. This
@@ -1576,10 +1718,6 @@ impl TabState {
         // layout pass will re-acquire it.
         drop(dlocked);
 
-        // Load the favicon now that the lock is released. Best-effort:
-        // a missing or undecodable icon just leaves `favicon_key` None.
-        let favicon_key = load_favicon(url, favicon_href);
-
         // Cap the source-view buffer so the dev-dock doesn't blow up
         // on a 5 MB page. 64 KB is plenty for "read the head + first
         // few hundred lines of body".
@@ -1589,32 +1727,36 @@ impl TabState {
             t.push_str("\n…(truncated)");
             t
         } else {
-            html.clone()
+            html.to_string()
         };
         let net_log = drain_net_capture();
 
-        Ok(Self {
-            title,
-            url: url.clone(),
-            net_log,
-            console_log,
-            source_html,
-            doc,
-            style,
-            body_node,
-            images,
-            svgs,
-            layout: None,
-            last_width: 0,
-            history: Vec::new(),
-            forward: Vec::new(),
-            scroll_y: 0.0,
-            page_inputs,
-            focused_input: autofocus_target,
-            page_selection: None,
-            js_ctx: Some(js_ctx),
-            favicon_key,
-        })
+        (
+            Self {
+                tab_id: fresh_tab_id(),
+                title,
+                url: url.clone(),
+                net_log,
+                console_log,
+                source_html,
+                doc,
+                style,
+                body_node,
+                images,
+                svgs,
+                layout: None,
+                last_width: 0,
+                history: Vec::new(),
+                forward: Vec::new(),
+                scroll_y: 0.0,
+                page_inputs,
+                focused_input: autofocus_target,
+                page_selection: None,
+                js_ctx: Some(js_ctx),
+                favicon_key,
+            },
+            bg_urls,
+        )
     }
 
     /// Replace the page contents with `new_url`, pushing the previous URL
@@ -1722,6 +1864,161 @@ impl TabState {
     }
 }
 
+// ---- async page loads ----
+//
+// Navigations run as a two-hop state machine so the event loop never
+// blocks on the network:
+//
+//   UI: start_load            → loader thread: fetch HTML
+//   UI: parse + run JS (boot) → loader thread: fetch CSS / images / favicon
+//   UI: style + swap into tab → loader thread: background images (paint-only)
+//
+// Loader threads post LoadMsg over an mpsc channel and wake the event
+// loop through the Redrawer; build_scene drains the channel each frame.
+
+/// How a finished load lands in the tab's history.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavOp {
+    /// Link click / address bar: push previous URL, clear forward.
+    Push,
+    /// Reload current page: history and scroll untouched.
+    Reload,
+    /// Back button: pop history, push current onto forward.
+    Back,
+    /// Forward button: pop forward, push current onto history.
+    Forward,
+    /// First load into a placeholder tab: no history change.
+    Replace,
+}
+
+enum LoadMsg {
+    Html {
+        id: u64,
+        result: Result<String, String>,
+    },
+    Resources {
+        id: u64,
+        sheets: Vec<bui_css::Stylesheet>,
+        images: Vec<(String, Option<ImageResource>)>,
+        favicon: Option<(String, bui_image::Image)>,
+    },
+    /// Late paint-only pixels; not tied to a pending load.
+    BgImages {
+        images: Vec<(String, bui_image::Image)>,
+    },
+}
+
+enum LoadStage {
+    /// Loader thread is fetching the HTML.
+    Html,
+    /// Page is booted (parsed, scripts ran) on the UI side; loader
+    /// thread is fetching stylesheets / images / favicon.
+    Resources {
+        booted: BootedPage,
+        html: String,
+        img_by_url: std::collections::HashMap<String, Vec<bui_dom::NodeId>>,
+    },
+}
+
+struct PendingLoad {
+    id: u64,
+    tab_id: u64,
+    /// Current fetch target — JS redirects move it.
+    url: Url,
+    /// The URL the navigation was initiated with; Back/Forward verify
+    /// the history stack still matches before mutating it.
+    target: Url,
+    op: NavOp,
+    redirects: u8,
+    stage: LoadStage,
+}
+
+fn notify_loader_done(redrawer: &Option<bui_shell::Redrawer>) {
+    if let Some(r) = redrawer {
+        r.request_redraw();
+    }
+}
+
+fn spawn_fetch_html(
+    tx: std::sync::mpsc::Sender<LoadMsg>,
+    redrawer: Option<bui_shell::Redrawer>,
+    id: u64,
+    url: Url,
+) {
+    std::thread::spawn(move || {
+        let result = fetch_html_text(&url);
+        if tx.send(LoadMsg::Html { id, result }).is_ok() {
+            notify_loader_done(&redrawer);
+        }
+    });
+}
+
+fn spawn_fetch_resources(
+    tx: std::sync::mpsc::Sender<LoadMsg>,
+    redrawer: Option<bui_shell::Redrawer>,
+    id: u64,
+    base: Url,
+    sources: Vec<SheetSource>,
+    img_urls: Vec<Url>,
+    favicon_url: Option<Url>,
+) {
+    std::thread::spawn(move || {
+        let sheets = resolve_sheet_sources(&base, sources);
+        let images = if img_urls.is_empty() {
+            Vec::new()
+        } else {
+            fetch_image_resources(img_urls)
+        };
+        let favicon = favicon_url.and_then(|u| {
+            let key = u.to_string();
+            shared_runtime()
+                .block_on(fetch_and_decode_image_async(&u))
+                .map(|img| (key, img))
+        });
+        let msg = LoadMsg::Resources {
+            id,
+            sheets,
+            images,
+            favicon,
+        };
+        if tx.send(msg).is_ok() {
+            notify_loader_done(&redrawer);
+        }
+    });
+}
+
+fn spawn_fetch_bg_images(
+    tx: std::sync::mpsc::Sender<LoadMsg>,
+    redrawer: Option<bui_shell::Redrawer>,
+    urls: Vec<Url>,
+) {
+    std::thread::spawn(move || {
+        let images = fetch_background_images(urls);
+        if !images.is_empty() && tx.send(LoadMsg::BgImages { images }).is_ok() {
+            notify_loader_done(&redrawer);
+        }
+    });
+}
+
+/// A tab shell that paints immediately while its real page loads:
+/// empty body, "Loading..." title, no resources.
+fn placeholder_tab(url: &Url) -> TabState {
+    let booted = boot_page(
+        url,
+        "<html><head><title>Loading...</title></head><body></body></html>",
+    );
+    let (tab, _) = TabState::finalize(
+        url,
+        "",
+        booted,
+        &[],
+        bui_layout::ImageRegistry::new(),
+        bui_layout::SvgRegistry::new(),
+        None,
+    );
+    tab
+}
+
 // ---- browser state ----
 
 struct BrowserState {
@@ -1748,6 +2045,13 @@ struct BrowserState {
     /// Wakes the event loop from background threads. Set once in
     /// `on_proxy` before the loop starts; manual ⌘U re-checks use it.
     redrawer: Option<bui_shell::Redrawer>,
+    /// In-flight async navigations, at most one per tab.
+    loads: Vec<PendingLoad>,
+    next_load_id: u64,
+    /// Loader threads send results here; `drain_loads` (run from
+    /// build_scene each frame) advances the state machine.
+    load_tx: std::sync::mpsc::Sender<LoadMsg>,
+    load_rx: std::sync::mpsc::Receiver<LoadMsg>,
 }
 
 /// Dev-dock panel selector. The dock is always one of three live
@@ -1774,6 +2078,7 @@ const DOCK_TAB_ORDER: [DockTab; 3] = [DockTab::Xhr, DockTab::Console, DockTab::S
 
 impl BrowserState {
     fn new(initial: TabState) -> Self {
+        let (load_tx, load_rx) = std::sync::mpsc::channel();
         Self {
             tabs: vec![initial],
             active: 0,
@@ -1786,6 +2091,10 @@ impl BrowserState {
             active_dock_tab: DockTab::Xhr,
             update: bui_update::new_shared_status(),
             redrawer: None,
+            loads: Vec::new(),
+            next_load_id: 1,
+            load_tx,
+            load_rx,
         }
     }
 
@@ -1806,9 +2115,251 @@ impl BrowserState {
 
     fn open_tab(&mut self, url_str: &str) {
         let Ok(url) = Url::parse(url_str) else { return };
-        let Ok(tab) = TabState::fetch(&url) else { return };
+        if url.is_internal() {
+            // Internal pages build instantly — no loader round-trip.
+            let Ok(tab) = TabState::fetch(&url) else { return };
+            self.tabs.push(tab);
+            self.active = self.tabs.len() - 1;
+            return;
+        }
+        let tab = placeholder_tab(&url);
+        let tab_id = tab.tab_id;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.start_load(tab_id, url, NavOp::Replace);
+    }
+
+    /// Kick off an async navigation for `tab_id`, cancelling any load
+    /// already in flight for that tab.
+    fn start_load(&mut self, tab_id: u64, url: Url, op: NavOp) {
+        let url = maybe_rewrite_google_search(&url);
+        self.loads.retain(|l| l.tab_id != tab_id);
+        let id = self.next_load_id;
+        self.next_load_id += 1;
+        self.loads.push(PendingLoad {
+            id,
+            tab_id,
+            url: url.clone(),
+            target: url.clone(),
+            op,
+            redirects: 0,
+            stage: LoadStage::Html,
+        });
+        spawn_fetch_html(self.load_tx.clone(), self.redrawer.clone(), id, url);
+    }
+
+    /// Navigate the active tab. Internal pages load synchronously
+    /// (instant); everything else goes through the async loader.
+    fn navigate_active(&mut self, url: &Url) {
+        let tab_id = self.active_tab().tab_id;
+        if url.is_internal() {
+            self.loads.retain(|l| l.tab_id != tab_id);
+            if let Err(e) = self.active_tab_mut().navigate_to(url) {
+                eprintln!("navigation failed: {e}");
+            }
+            return;
+        }
+        self.start_load(tab_id, url.clone(), NavOp::Push);
+    }
+
+    fn reload_active(&mut self) -> bool {
+        let tab_id = self.active_tab().tab_id;
+        let url = self.active_tab().url.clone();
+        if url.is_internal() {
+            self.loads.retain(|l| l.tab_id != tab_id);
+            return self.active_tab_mut().reload();
+        }
+        self.start_load(tab_id, url, NavOp::Reload);
+        true
+    }
+
+    fn back_active(&mut self) -> bool {
+        let tab_id = self.active_tab().tab_id;
+        let Some(target) = self.active_tab().history.last().cloned() else {
+            return false;
+        };
+        if target.is_internal() {
+            self.loads.retain(|l| l.tab_id != tab_id);
+            return self.active_tab_mut().go_back();
+        }
+        self.start_load(tab_id, target, NavOp::Back);
+        true
+    }
+
+    fn forward_active(&mut self) -> bool {
+        let tab_id = self.active_tab().tab_id;
+        let Some(target) = self.active_tab().forward.last().cloned() else {
+            return false;
+        };
+        if target.is_internal() {
+            self.loads.retain(|l| l.tab_id != tab_id);
+            return self.active_tab_mut().go_forward();
+        }
+        self.start_load(tab_id, target, NavOp::Forward);
+        true
+    }
+
+    /// URL the active tab is currently navigating to, if a load is in
+    /// flight — drives the status-line "loading" indicator.
+    fn active_load_url(&self) -> Option<String> {
+        let tab_id = self.active_tab().tab_id;
+        self.loads
+            .iter()
+            .find(|l| l.tab_id == tab_id)
+            .map(|l| l.url.to_string())
+    }
+
+    /// Advance every load whose loader thread reported in. Runs on the
+    /// UI thread (parsing, JS, and styling are pinned here); called
+    /// from build_scene, which the Redrawer guarantees runs after
+    /// every loader message.
+    fn drain_loads(&mut self) {
+        loop {
+            let msg = match self.load_rx.try_recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                LoadMsg::Html { id, result } => self.on_html_ready(id, result),
+                LoadMsg::Resources {
+                    id,
+                    sheets,
+                    images,
+                    favicon,
+                } => self.on_resources_ready(id, sheets, images, favicon),
+                LoadMsg::BgImages { images } => {
+                    for (key, image) in images {
+                        bui_gpu::enqueue_upload(key, image);
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_html_ready(&mut self, id: u64, result: Result<String, String>) {
+        let Some(pos) = self.loads.iter().position(|l| l.id == id) else {
+            return; // cancelled
+        };
+        let html = match result {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("load {}: {e}", self.loads[pos].url);
+                self.loads.remove(pos);
+                return;
+            }
+        };
+        let (tx, redrawer) = (self.load_tx.clone(), self.redrawer.clone());
+        let load = &mut self.loads[pos];
+        let booted = boot_page(&load.url, &html);
+        if let Some(redirect) = booted.redirect.clone() {
+            if load.redirects < 8 {
+                load.redirects += 1;
+                load.url = redirect.clone();
+                load.stage = LoadStage::Html;
+                spawn_fetch_html(tx, redrawer, id, redirect);
+                return;
+            }
+        }
+        let (sources, (img_by_url, img_urls), favicon_href) = {
+            let d = booted.doc.lock().unwrap();
+            (
+                collect_sheet_sources(&load.url, &d),
+                collect_image_urls(&load.url, &d),
+                find_favicon_href(&d),
+            )
+        };
+        let favicon_url = favicon_fetch_url(&load.url, favicon_href);
+        let base = load.url.clone();
+        load.stage = LoadStage::Resources {
+            booted,
+            html,
+            img_by_url,
+        };
+        spawn_fetch_resources(tx, redrawer, id, base, sources, img_urls, favicon_url);
+    }
+
+    fn on_resources_ready(
+        &mut self,
+        id: u64,
+        sheets: Vec<bui_css::Stylesheet>,
+        images: Vec<(String, Option<ImageResource>)>,
+        favicon: Option<(String, bui_image::Image)>,
+    ) {
+        let Some(pos) = self.loads.iter().position(|l| l.id == id) else {
+            return; // cancelled
+        };
+        let load = self.loads.remove(pos);
+        let LoadStage::Resources {
+            booted,
+            html,
+            img_by_url,
+        } = load.stage
+        else {
+            return; // stale message from a superseded stage
+        };
+        let (img_reg, svg_reg) = build_image_registries(images, &img_by_url);
+        let favicon_key = favicon.map(|(key, image)| {
+            bui_gpu::enqueue_upload(key.clone(), image);
+            key
+        });
+        let (next, bg_urls) = TabState::finalize(
+            &load.url,
+            &html,
+            booted,
+            &sheets,
+            img_reg,
+            svg_reg,
+            favicon_key,
+        );
+        if !bg_urls.is_empty() {
+            spawn_fetch_bg_images(self.load_tx.clone(), self.redrawer.clone(), bg_urls);
+        }
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.tab_id == load.tab_id) else {
+            return; // tab closed while loading
+        };
+        match load.op {
+            NavOp::Push => {
+                let prev_url = tab.url.clone();
+                tab.replace_page_artifacts(next);
+                tab.history.push(prev_url);
+                tab.forward.clear();
+                tab.scroll_y = 0.0;
+            }
+            NavOp::Reload => {
+                // replace_page_artifacts keeps scroll_y, matching the
+                // old synchronous reload.
+                tab.replace_page_artifacts(next);
+            }
+            NavOp::Back => {
+                // Only mutate history if it still ends with the URL
+                // this navigation was initiated for — the user may
+                // have navigated again in the meantime.
+                if tab.history.last().map(|u| u.to_string())
+                    == Some(load.target.to_string())
+                {
+                    tab.history.pop();
+                    let prev = tab.url.clone();
+                    tab.replace_page_artifacts(next);
+                    tab.forward.push(prev);
+                    tab.scroll_y = 0.0;
+                }
+            }
+            NavOp::Forward => {
+                if tab.forward.last().map(|u| u.to_string())
+                    == Some(load.target.to_string())
+                {
+                    tab.forward.pop();
+                    let prev = tab.url.clone();
+                    tab.replace_page_artifacts(next);
+                    tab.history.push(prev);
+                    tab.scroll_y = 0.0;
+                }
+            }
+            NavOp::Replace => {
+                tab.replace_page_artifacts(next);
+                tab.scroll_y = 0.0;
+            }
+        }
     }
 
     fn close_active(&mut self) {
@@ -1959,6 +2510,9 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         // Window close is handled by winit on next event; nothing to paint.
         return dl;
     }
+    // Apply any async page loads whose loader threads reported in —
+    // parse/JS/style for finished stages runs here, on the UI thread.
+    st.drain_loads();
     // Per-frame JS tick: fire every setTimeout / setInterval /
     // requestAnimationFrame callback whose deadline has elapsed,
     // then drain microtasks. Surfaces any console output / errors
@@ -1992,9 +2546,7 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         if let Ok(next_url) = cur_url.join(&target) {
             if next_url.to_string() != cur_url.to_string() {
                 eprintln!("↳ JS-timer redirect → {next_url}");
-                if let Err(e) = st.active_tab_mut().navigate_to(&next_url) {
-                    eprintln!("timer redirect failed: {e}");
-                }
+                st.navigate_active(&next_url);
             }
         }
     }
@@ -2347,7 +2899,16 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         }
     };
     let update_status = st.update.lock().unwrap().clone();
-    paint_status(w, h, &active_url, scroll_pct, &update_status, &mut dl);
+    let loading = st.active_load_url();
+    paint_status(
+        w,
+        h,
+        &active_url,
+        scroll_pct,
+        loading.as_deref(),
+        &update_status,
+        &mut dl,
+    );
     dl
 }
 
@@ -3170,6 +3731,7 @@ fn paint_status(
     height: f32,
     url: &str,
     scroll_pct: u32,
+    loading: Option<&str>,
     update: &UpdateStatus,
     dl: &mut DisplayList,
 ) {
@@ -3202,7 +3764,11 @@ fn paint_status(
     });
 
     let ctx_x = 8.0 + mode_w + 10.0;
-    let ctx = truncate_to_width(url, font, 10.5, (width * 0.5 - ctx_x).max(0.0));
+    let ctx_text = match loading {
+        Some(target) => format!("loading {target}"),
+        None => url.to_string(),
+    };
+    let ctx = truncate_to_width(&ctx_text, font, 10.5, (width * 0.5 - ctx_x).max(0.0));
     let ctx_advance = font.measure_text(&ctx, 10.5);
     dl.commands.push(PaintCommand::Text {
         x: ctx_x,
@@ -3950,9 +4516,9 @@ fn handle_click(
                 st.address_input.blur();
             }
             return match btn {
-                NavButton::Back => st.active_tab_mut().go_back(),
-                NavButton::Forward => st.active_tab_mut().go_forward(),
-                NavButton::Reload => st.active_tab_mut().reload(),
+                NavButton::Back => st.back_active(),
+                NavButton::Forward => st.forward_active(),
+                NavButton::Reload => st.reload_active(),
             };
         }
         if address_bar_contains(viewport.width, x, y, sidebar_w) {
@@ -4116,9 +4682,7 @@ fn handle_click(
             if let Some(target) = outcome.pending_nav {
                 if let Ok(next_url) = st.active_tab().url.join(&target) {
                     eprintln!("↳ form submit (JS-redirect) → {next_url}");
-                    if let Err(e) = st.active_tab_mut().navigate_to(&next_url) {
-                        eprintln!("submit redirect failed: {e}");
-                    }
+                    st.navigate_active(&next_url);
                     return true;
                 }
             }
@@ -4128,9 +4692,7 @@ fn handle_click(
             }
             if let Some(url) = build_form_url(st.active_tab(), form_node) {
                 eprintln!("↳ form submit → {url}");
-                if let Err(e) = st.active_tab_mut().navigate_to(&url) {
-                    eprintln!("submit failed: {e}");
-                }
+                st.navigate_active(&url);
             }
             return true;
         }
@@ -4173,9 +4735,7 @@ fn handle_click(
         st.open_tab(&s);
     } else {
         eprintln!("→ navigating to {new_url}");
-        if let Err(e) = st.active_tab_mut().navigate_to(&new_url) {
-            eprintln!("navigation failed: {e}");
-        }
+        st.navigate_active(&new_url);
     }
     true
 }
@@ -4439,6 +4999,7 @@ mod tests {
         let doc = bui_dom::Document::new();
         let style = bui_style::style_document(&doc, &[]);
         TabState {
+            tab_id: fresh_tab_id(),
             title: title.to_string(),
             url: Url::parse(url).unwrap(),
             net_log: Vec::new(),
@@ -4489,6 +5050,7 @@ mod tests {
         doc.append_child(form, submit);
         let style = bui_style::style_document(&doc, &[]);
         let tab = TabState {
+            tab_id: fresh_tab_id(),
             title: String::new(),
             url: Url::parse("https://example.com/").unwrap(),
             net_log: Vec::new(),
@@ -4954,9 +5516,9 @@ fn handle_key(state: &Arc<Mutex<BrowserState>>, press: KeyPress) -> bool {
             }
             true
         }
-        Some('r') => st.active_tab_mut().reload(),
-        Some('[') => st.active_tab_mut().go_back(),
-        Some(']') => st.active_tab_mut().go_forward(),
+        Some('r') => st.reload_active(),
+        Some('[') => st.back_active(),
+        Some(']') => st.forward_active(),
         Some(c @ '1'..='8') => {
             let idx = (c as u32 - '1' as u32) as usize;
             st.switch_to(idx);
@@ -5044,9 +5606,7 @@ fn handle_page_input_key(st: &mut BrowserState, press: KeyPress) -> Option<bool>
                 if let Some(target) = outcome.pending_nav {
                     if let Ok(next_url) = st.active_tab().url.join(&target) {
                         eprintln!("↳ form submit (Enter, JS-redirect) → {next_url}");
-                        if let Err(e) = st.active_tab_mut().navigate_to(&next_url) {
-                            eprintln!("submit redirect failed: {e}");
-                        }
+                        st.navigate_active(&next_url);
                         return Some(true);
                     }
                 }
@@ -5056,9 +5616,7 @@ fn handle_page_input_key(st: &mut BrowserState, press: KeyPress) -> Option<bool>
                 }
                 if let Some(url) = build_form_url(st.active_tab(), form_node) {
                     eprintln!("↳ form submit (Enter) → {url}");
-                    if let Err(e) = st.active_tab_mut().navigate_to(&url) {
-                        eprintln!("submit failed: {e}");
-                    }
+                    st.navigate_active(&url);
                 }
             }
             Some(true)
@@ -5139,11 +5697,7 @@ fn handle_edit_key(st: &mut BrowserState, press: KeyPress) -> Option<bool> {
                     format!("https://{trimmed}")
                 };
                 match Url::parse(&candidate) {
-                    Ok(url) => {
-                        if let Err(e) = st.active_tab_mut().navigate_to(&url) {
-                            eprintln!("navigation failed: {e}");
-                        }
-                    }
+                    Ok(url) => st.navigate_active(&url),
                     Err(e) => eprintln!("invalid URL {trimmed:?}: {e}"),
                 }
             }
