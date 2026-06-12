@@ -68,6 +68,9 @@ const START_HTML: &str = r##"<!DOCTYPE html>
     .card {
       display: flex;
       align-items: center;
+      /* gap, not margin-right on .tile — the flex layout engine only
+         honors auto margins on items, so a fixed margin collapses. */
+      gap: 14px;
       flex: 1 1 320px;
       background: #ffffff;
       border: 1px solid #e8e4d8;
@@ -83,7 +86,6 @@ const START_HTML: &str = r##"<!DOCTYPE html>
       padding: 9px 0;
       text-align: center;
       border-radius: 12px;
-      margin-right: 14px;
       color: #ffffff;
       font-size: 22px;
       font-weight: bold;
