@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "bui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "bui-css",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "bui-css"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-dom",
  "thiserror 2.0.18",
@@ -216,11 +216,11 @@ dependencies = [
 
 [[package]]
 name = "bui-dom"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bui-gpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-image",
  "bui-paint",
@@ -234,21 +234,21 @@ dependencies = [
 
 [[package]]
 name = "bui-html"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-dom",
 ]
 
 [[package]]
 name = "bui-image"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "bui-js"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-css",
  "bui-dom",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "bui-layout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-css",
  "bui-dom",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "bui-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-url",
  "rustls",
@@ -282,11 +282,11 @@ dependencies = [
 
 [[package]]
 name = "bui-paint"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bui-shell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-gpu",
  "bui-paint",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "bui-style"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-css",
  "bui-dom",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "bui-text"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "peniko",
  "skrifa",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "bui-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bui-net",
  "bui-url",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "bui-url"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
