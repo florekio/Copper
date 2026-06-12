@@ -621,6 +621,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fdeflate"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3104,6 +3115,7 @@ name = "zinc"
 version = "0.4.0"
 dependencies = [
  "bitflags 2.11.1",
+ "fancy-regex",
  "indexmap",
  "regex",
  "unicode-id-start",
