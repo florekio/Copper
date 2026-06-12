@@ -1,0 +1,44 @@
+<html><body><div id="root"></div>
+<script src="react.js"></script>
+<script src="react-dom.js"></script>
+<script>
+var e = React.createElement;
+function App() {
+  var ts = React.useState('');
+  var text = ts[0], setText = ts[1];
+  var ls = React.useState([]);
+  var todos = ls[0], setTodos = ls[1];
+  console.log('RENDER text="' + text + '" todos.len=' + todos.length + ' isArr=' + Array.isArray(todos));
+  return e('div', null,
+    e('input', { id: 'in', value: text,
+      onChange: function (ev) { console.log('onChange fired: "' + ev.target.value + '"'); setText(ev.target.value); } }),
+    e('button', { id: 'add', onClick: function () {
+      console.log('ADD-CLICK text="' + text + '"');
+      if (text) { setTodos(todos.concat([text])); setText(''); } } }, 'add'),
+    e('span', null, 'DRAFT:' + text),
+    e('ul', null, todos.map(function (t, i) { return e('li', { key: i }, 'TODO-' + t); })));
+}
+ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+var stage = 0;
+function drive(n) {
+  var root = document.getElementById('root');
+  var input = document.getElementById('in');
+  var text = root.textContent || '';
+  if (stage === 0 && input) {
+    stage = 1;
+    input.value = 'buy-milk';
+    input.dispatchEvent({ type: 'input' });
+    console.log('typed');
+  } else if (stage === 1 && text.indexOf('DRAFT:buy-milk') !== -1) {
+    stage = 2;
+    document.getElementById('add').click();
+    console.log('clicked add');
+  } else if (stage === 2 && text.indexOf('TODO-buy-milk') !== -1) {
+    console.log('TODOMVC-OK: ' + text);
+    return;
+  }
+  if (n > 80) { console.log('GAVE-UP stage=' + stage + ' text="' + text + '" inputVal="' + (input ? input.value : '?') + '"'); return; }
+  setTimeout(function(){ drive(n+1); }, 0);
+}
+drive(0);
+</script></body></html>

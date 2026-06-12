@@ -2322,6 +2322,13 @@ impl BindingContext {
         });
 
         let timers_for_clear = timers.clone();
+        engine.register_host_fn("__queueMicrotaskHost", move |vm, _this, args| {
+            if let Some(cb) = args.first().copied() {
+                vm.host_enqueue_microtask(cb);
+            }
+            Ok(Value::undefined())
+        });
+
         engine.register_host_fn("__clearTimerHost", move |_vm, _this, args| {
             let Some(id) = args.first().and_then(|v| v.as_number()) else {
                 return Ok(Value::null());
@@ -2771,6 +2778,19 @@ function _makeElemWrapper(handle) {
             if (!t) return false;
             return __elemDispatchEvent(this._h, t);
         },
+        // Control type. `<input>` without a type attribute is type
+        // "text" per spec; React's isTextInputElement gates its whole
+        // onChange plugin on this defaulting correctly.
+        get type() {
+            var tag = __elemTagName(this._h);
+            var t = __elemGetAttr(this._h, 'type');
+            if (t != null && t !== '') return String(t).toLowerCase();
+            if (tag === 'INPUT') return 'text';
+            if (tag === 'BUTTON') return 'submit';
+            if (tag === 'SELECT') return 'select-one';
+            if (tag === 'TEXTAREA') return 'textarea';
+            return '';
+        },
         // Form-control value. For <input> reads the `value`
         // attribute. For <textarea> reads the text content.
         // Setter writes back through `setAttribute`. Doesn't
@@ -2927,6 +2947,29 @@ function _makeElemWrapper(handle) {
     };
 }
 var document = {
+    // on* feature-detection surface: `'oninput' in document` is how
+    // React (and many libs) probe event support. Null per spec for
+    // unassigned handlers. ontouchstart deliberately absent — its
+    // presence advertises a touch device.
+    oninput: null,
+    onchange: null,
+    onclick: null,
+    ondblclick: null,
+    onkeydown: null,
+    onkeyup: null,
+    onkeypress: null,
+    onsubmit: null,
+    onfocus: null,
+    onblur: null,
+    onmousedown: null,
+    onmouseup: null,
+    onmousemove: null,
+    onmouseover: null,
+    onmouseout: null,
+    onscroll: null,
+    onwheel: null,
+    onload: null,
+    onerror: null,
     get body() {
         return _wrapElem(__docBody());
     },
@@ -3622,15 +3665,12 @@ function requestAnimationFrame(fn) {
 }
 function cancelAnimationFrame(id) { __clearTimerHost(id); }
 function queueMicrotask(fn) {
-    // Microtasks aren't macrotasks — running them synchronously
-    // is still strictly better than queueing them onto the
-    // timer queue, which would defer to the next frame. Real
-    // queueMicrotask semantics require draining after the
-    // current synchronous task; for now we accept "fire now"
-    // since user code typically doesn't observe the difference.
-    if (typeof fn === 'function') {
-        try { fn(); } catch (e) {}
-    }
+    // Real microtask semantics: enqueue on the engine's microtask
+    // queue, drained after the current task (end of script eval /
+    // timer tick / event dispatch). Running callbacks synchronously
+    // broke run-to-completion — React schedules its sync-render
+    // flush through here and renders mid-event-handler otherwise.
+    if (typeof fn === 'function') { __queueMicrotaskHost(fn); }
 }
 // addEventListener wrapper — routes through the __addEventListener
 // host fn with the right target handle. `null` resolves to the

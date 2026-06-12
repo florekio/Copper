@@ -40,4 +40,14 @@ else
   echo "FAIL: click -> setState -> re-render"
   fail=1
 fi
+
+# TodoMVC mechanics: controlled input (value + onChange), batched
+# setStates in one handler, list re-render from state.
+TOUT=$(cargo run -q --bin copper -- layout "http://127.0.0.1:$PORT/todo.html" 2>&1 >/dev/null)
+if echo "$TOUT" | grep -q 'TODOMVC-OK'; then
+  echo "OK  : controlled input -> add todo -> list renders"
+else
+  echo "FAIL: controlled input -> add todo -> list renders"
+  fail=1
+fi
 if [ $fail -eq 0 ]; then echo "react_smoke: OK"; else echo "react_smoke: FAILED"; exit 1; fi
