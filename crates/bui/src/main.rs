@@ -2465,13 +2465,25 @@ impl BrowserState {
     }
 
     /// URL the active tab is currently navigating to, if a load is in
-    /// flight — drives the status-line "loading" indicator.
+    /// flight — drives the status-line "loading" indicator and the
+    /// reload button's stop (✕) state.
     fn active_load_url(&self) -> Option<String> {
         let tab_id = self.active_tab().tab_id;
         self.loads
             .iter()
             .find(|l| l.tab_id == tab_id)
             .map(|l| l.url.to_string())
+    }
+
+    /// Cancel the active tab's in-flight load (the ✕ on the reload
+    /// button while loading, like Chrome). The loader thread keeps
+    /// running but its result finds no PendingLoad entry and is
+    /// dropped — same mechanism as closing the tab mid-load.
+    fn stop_active_load(&mut self) -> bool {
+        let tab_id = self.active_tab().tab_id;
+        let before = self.loads.len();
+        self.loads.retain(|l| l.tab_id != tab_id);
+        self.loads.len() != before
     }
 
     /// Advance every load whose loader thread reported in. Runs on the
@@ -3212,6 +3224,7 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
 
     // Top bar (nav + URL pill, to the right of the sidebar).
     let active_favicon = st.active_tab().favicon_key.clone();
+    let is_loading = st.active_load_url().is_some();
     paint_chrome(
         viewport.width,
         viewport.cursor,
@@ -3221,6 +3234,7 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         tab_count,
         can_back,
         can_forward,
+        is_loading,
         sidebar_w,
         active_favicon.as_deref(),
         &mut dl,
@@ -3281,6 +3295,7 @@ fn paint_nav_buttons(
     cursor: (f32, f32),
     can_back: bool,
     can_forward: bool,
+    loading: bool,
     sidebar_w: f32,
     dl: &mut DisplayList,
 ) {
@@ -3323,6 +3338,26 @@ fn paint_nav_buttons(
                     (cx - 2.0, cy + half + 1.0),
                 ];
                 dl.fill_path(pts, icon_color);
+            }
+            NavButton::Reload if loading => {
+                // Load in flight: the button is a stop (✕), Chrome-style.
+                // Two crossing strokes, each a thin filled quad.
+                let r_arm = 5.0;
+                let t = 1.2; // half stroke width
+                // "\" stroke
+                dl.fill_path(vec![
+                    (cx - r_arm + t, cy - r_arm - t),
+                    (cx + r_arm + t, cy + r_arm - t),
+                    (cx + r_arm - t, cy + r_arm + t),
+                    (cx - r_arm - t, cy - r_arm + t),
+                ], icon_color);
+                // "/" stroke
+                dl.fill_path(vec![
+                    (cx + r_arm - t, cy - r_arm - t),
+                    (cx + r_arm + t, cy - r_arm + t),
+                    (cx - r_arm + t, cy + r_arm + t),
+                    (cx - r_arm - t, cy + r_arm - t),
+                ], icon_color);
             }
             NavButton::Reload => {
                 // ~270° arc with arrowhead pointing tangentially. Rendered
@@ -4187,6 +4222,7 @@ fn paint_chrome(
     _tab_count: usize,
     can_back: bool,
     can_forward: bool,
+    loading: bool,
     sidebar_w: f32,
     favicon: Option<&str>,
     dl: &mut DisplayList,
@@ -4205,8 +4241,8 @@ fn paint_chrome(
         TOP_BAR_RULE,
     );
 
-    // Nav buttons — back / forward / reload.
-    paint_nav_buttons(cursor, can_back, can_forward, sidebar_w, dl);
+    // Nav buttons — back / forward / reload (✕ while loading).
+    paint_nav_buttons(cursor, can_back, can_forward, loading, sidebar_w, dl);
 
     // Address-bar pill. Paper-white surface with a copper focus halo
     // (replaces the blue halo the legacy chrome used).
@@ -4883,7 +4919,15 @@ fn handle_click(
             return match btn {
                 NavButton::Back => st.back_active(),
                 NavButton::Forward => st.forward_active(),
-                NavButton::Reload => st.reload_active(),
+                // While a load is in flight the button shows ✕ — clicking
+                // it stops the load instead of reloading (Chrome behavior).
+                NavButton::Reload => {
+                    if st.stop_active_load() {
+                        true
+                    } else {
+                        st.reload_active()
+                    }
+                }
             };
         }
         if address_bar_contains(viewport.width, x, y, sidebar_w) {
