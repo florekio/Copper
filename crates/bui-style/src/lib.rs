@@ -84,6 +84,7 @@ pub fn style_document_with_viewport(
         .iter()
         .map(|(o, n, r)| (*o, *n, r))
         .collect();
+    let index = RuleIndex::build(&flat_refs);
 
     let mut values: HashMap<NodeId, ComputedValues> = HashMap::new();
     let mut before: HashMap<NodeId, ComputedValues> = HashMap::new();
@@ -92,12 +93,94 @@ pub fn style_document_with_viewport(
         doc,
         doc.root,
         &flat_refs,
+        &index,
         None,
         &mut values,
         &mut before,
         &mut after,
     );
     StyleTree { values, before, after }
+}
+
+/// One selector of one flattened rule, addressable for the per-rule
+/// best-specificity merge.
+#[derive(Clone, Copy)]
+struct IndexedSelector<'a> {
+    /// Position in the flat rules slice.
+    rule_pos: usize,
+    /// Position inside the rule's selector list (tie-break: the first
+    /// max-specificity selector decides the pseudo-element bucket).
+    sel_pos: usize,
+    sel: &'a bui_css::Selector,
+}
+
+/// Rules bucketed by the rightmost compound of each selector — its
+/// id, else first class, else tag — so the cascade only runs full
+/// `Selector::matches` on selectors that *could* match an element,
+/// instead of every selector of every rule (O(elements × rules)).
+/// The bucket key is a necessary condition for a match; `matches`
+/// still re-validates everything, so imprecision here is impossible.
+struct RuleIndex<'a> {
+    by_id: HashMap<&'a str, Vec<IndexedSelector<'a>>>,
+    by_class: HashMap<&'a str, Vec<IndexedSelector<'a>>>,
+    /// Keys lowercased (tag matching is ASCII-case-insensitive).
+    by_tag: HashMap<String, Vec<IndexedSelector<'a>>>,
+    universal: Vec<IndexedSelector<'a>>,
+}
+
+impl<'a> RuleIndex<'a> {
+    fn build(rules: &[(Origin, usize, &'a StyleRule)]) -> Self {
+        let mut idx = RuleIndex {
+            by_id: HashMap::new(),
+            by_class: HashMap::new(),
+            by_tag: HashMap::new(),
+            universal: Vec::new(),
+        };
+        for (rule_pos, (_, _, sr)) in rules.iter().enumerate() {
+            for (sel_pos, sel) in sr.selectors.iter().enumerate() {
+                let entry = IndexedSelector { rule_pos, sel_pos, sel };
+                match sel.compounds.last() {
+                    Some(cp) if cp.id.is_some() => {
+                        idx.by_id.entry(cp.id.as_deref().unwrap()).or_default().push(entry);
+                    }
+                    Some(cp) if !cp.classes.is_empty() => {
+                        idx.by_class.entry(cp.classes[0].as_str()).or_default().push(entry);
+                    }
+                    Some(cp) if cp.tag.as_deref().is_some_and(|t| t != "*") => {
+                        idx.by_tag
+                            .entry(cp.tag.as_deref().unwrap().to_ascii_lowercase())
+                            .or_default()
+                            .push(entry);
+                    }
+                    _ => idx.universal.push(entry),
+                }
+            }
+        }
+        idx
+    }
+
+    /// Selectors whose rightmost compound could match `elem`.
+    fn candidates(&self, elem: &bui_dom::Element, out: &mut Vec<IndexedSelector<'a>>) {
+        out.extend_from_slice(&self.universal);
+        let tag_hit = if elem.name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.by_tag.get(&elem.name.to_ascii_lowercase())
+        } else {
+            self.by_tag.get(elem.name.as_str())
+        };
+        if let Some(list) = tag_hit {
+            out.extend_from_slice(list);
+        }
+        for class in elem.classes() {
+            if let Some(list) = self.by_class.get(class) {
+                out.extend_from_slice(list);
+            }
+        }
+        if let Some(id) = elem.get_attr("id") {
+            if let Some(list) = self.by_id.get(id) {
+                out.extend_from_slice(list);
+            }
+        }
+    }
 }
 
 /// Walk a list of rules, collecting `Rule::Style` entries directly and
@@ -153,10 +236,59 @@ fn flatten_rules(
     }
 }
 
+/// Rules matching `node`, in rule order, each with the best (highest,
+/// first-wins-on-tie) specificity among its matching selectors and
+/// that selector's pseudo-element. Candidates come from the index
+/// buckets; everything else cannot match by its rightmost compound.
+fn matched_rules<'a>(
+    doc: &Document,
+    node: NodeId,
+    index: &RuleIndex<'a>,
+) -> Vec<(usize, Specificity, Option<&'a str>)> {
+    let mut candidates: Vec<IndexedSelector> = Vec::new();
+    if let Some(elem) = doc.element(node) {
+        index.candidates(elem, &mut candidates);
+    }
+    let mut hits: Vec<(usize, usize, Specificity, Option<&str>)> = Vec::new();
+    for cand in &candidates {
+        if cand.sel.matches(doc, node) {
+            hits.push((
+                cand.rule_pos,
+                cand.sel_pos,
+                cand.sel.specificity(),
+                cand.sel.pseudo_element(),
+            ));
+        }
+    }
+    hits.sort_unstable_by_key(|h| (h.0, h.1));
+    let mut out = Vec::with_capacity(hits.len());
+    let mut i = 0;
+    while i < hits.len() {
+        let rule_pos = hits[i].0;
+        let mut best = hits[i].2;
+        let mut best_pseudo = hits[i].3;
+        let mut j = i + 1;
+        while j < hits.len() && hits[j].0 == rule_pos {
+            // Strict > replicates the unindexed loop: the first
+            // max-specificity selector in source order decides the
+            // pseudo-element bucket.
+            if hits[j].2 > best {
+                best = hits[j].2;
+                best_pseudo = hits[j].3;
+            }
+            j += 1;
+        }
+        out.push((rule_pos, best, best_pseudo));
+        i = j;
+    }
+    out
+}
+
 fn cascade_recursive(
     doc: &Document,
     node: NodeId,
     rules: &[(Origin, usize, &StyleRule)],
+    index: &RuleIndex,
     parent: Option<&ComputedValues>,
     out: &mut HashMap<NodeId, ComputedValues>,
     before_out: &mut HashMap<NodeId, ComputedValues>,
@@ -166,7 +298,7 @@ fn cascade_recursive(
         // Non-elements still need a children walk.
         let mut child = doc.node(node).first_child;
         while let Some(c) = child {
-            cascade_recursive(doc, c, rules, parent, out, before_out, after_out);
+            cascade_recursive(doc, c, rules, index, parent, out, before_out, after_out);
             child = doc.node(c).next_sibling;
         }
         return;
@@ -176,44 +308,32 @@ fn cascade_recursive(
     // real element (selectors with no pseudo-element) and stash any
     // ::before / ::after hits separately so we can build their
     // synthetic CVs after the parent CV is finalised.
+    //
+    // Only selectors from the element's index buckets are tested —
+    // everything else is guaranteed not to match by its rightmost
+    // compound. Hits are then merged per rule with the same
+    // first-max-specificity-wins logic the unindexed loop used.
     let mut matches: Vec<(CascadeKey, Declaration)> = Vec::new();
     let mut before_matches: Vec<(CascadeKey, Declaration)> = Vec::new();
     let mut after_matches: Vec<(CascadeKey, Declaration)> = Vec::new();
-    for (origin, order, sr) in rules {
-        let mut best: Option<Specificity> = None;
-        let mut best_pseudo: Option<&str> = None;
-        for sel in &sr.selectors {
-            if sel.matches(doc, node) {
-                let sp = sel.specificity();
-                let pe = sel.pseudo_element();
-                let take = match best {
-                    Some(cur) => sp > cur,
-                    None => true,
-                };
-                if take {
-                    best = Some(sp);
-                    best_pseudo = pe;
-                }
-            }
-        }
-        if let Some(sp) = best {
-            let bucket = match best_pseudo {
-                Some("before") => &mut before_matches,
-                Some("after") => &mut after_matches,
-                Some(_) => continue, // unsupported pseudo (::first-letter etc)
-                None => &mut matches,
-            };
-            for decl in &sr.declarations {
-                bucket.push((
-                    CascadeKey {
-                        origin: *origin,
-                        important: decl.important,
-                        specificity: sp,
-                        source_order: *order,
-                    },
-                    decl.clone(),
-                ));
-            }
+    for (rule_pos, best, best_pseudo) in matched_rules(doc, node, index) {
+        let (origin, order, sr) = rules[rule_pos];
+        let bucket = match best_pseudo {
+            Some("before") => &mut before_matches,
+            Some("after") => &mut after_matches,
+            Some(_) => continue, // unsupported pseudo (::first-letter etc)
+            None => &mut matches,
+        };
+        for decl in &sr.declarations {
+            bucket.push((
+                CascadeKey {
+                    origin,
+                    important: decl.important,
+                    specificity: best,
+                    source_order: order,
+                },
+                decl.clone(),
+            ));
         }
     }
 
@@ -303,7 +423,7 @@ fn cascade_recursive(
 
     let mut child = doc.node(node).first_child;
     while let Some(c) = child {
-        cascade_recursive(doc, c, rules, Some(&cv), out, before_out, after_out);
+        cascade_recursive(doc, c, rules, index, Some(&cv), out, before_out, after_out);
         child = doc.node(c).next_sibling;
     }
 }
@@ -500,6 +620,109 @@ fn substitute_vars(value: &str, vars: &std::collections::HashMap<String, String>
 mod tests {
     use super::*;
     use bui_dom::Document;
+
+    /// The unindexed matching loop this crate shipped before the
+    /// RuleIndex — kept as the reference implementation. The index is
+    /// only a pre-filter, so for any document and stylesheet both
+    /// paths must produce identical (rule, specificity, pseudo) sets.
+    fn matched_rules_bruteforce<'a>(
+        doc: &Document,
+        node: NodeId,
+        rules: &[(Origin, usize, &'a StyleRule)],
+    ) -> Vec<(usize, Specificity, Option<&'a str>)> {
+        let mut out = Vec::new();
+        for (rule_pos, (_, _, sr)) in rules.iter().enumerate() {
+            let mut best: Option<Specificity> = None;
+            let mut best_pseudo: Option<&str> = None;
+            for sel in &sr.selectors {
+                if sel.matches(doc, node) {
+                    let sp = sel.specificity();
+                    let take = match best {
+                        Some(cur) => sp > cur,
+                        None => true,
+                    };
+                    if take {
+                        best = Some(sp);
+                        best_pseudo = sel.pseudo_element();
+                    }
+                }
+            }
+            if let Some(sp) = best {
+                out.push((rule_pos, sp, best_pseudo));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rule_index_matches_bruteforce() {
+        // A tree with ids, multiple classes, siblings, and nesting,
+        // against selectors hitting every index bucket: tag, class,
+        // id, universal, compounds, combinators, :not/:is, pseudo-
+        // elements, and equal-specificity ties within one rule.
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root, html);
+        doc.append_child(html, body);
+        let mut nodes = vec![doc.root, html, body];
+        let main = doc.create_element("div");
+        doc.element_mut(main).unwrap().set_attr("class", "page main");
+        doc.element_mut(main).unwrap().set_attr("id", "content");
+        doc.append_child(body, main);
+        nodes.push(main);
+        for i in 0..6 {
+            let p = doc.create_element(if i % 2 == 0 { "p" } else { "span" });
+            if i % 3 == 0 {
+                doc.element_mut(p).unwrap().set_attr("class", "note warn");
+            }
+            if i == 4 {
+                doc.element_mut(p).unwrap().set_attr("id", "special");
+            }
+            doc.append_child(main, p);
+            nodes.push(p);
+            let em = doc.create_element("em");
+            doc.append_child(p, em);
+            nodes.push(em);
+        }
+
+        let sheet = Stylesheet::parse(
+            "p { color: red; }
+             .note { color: blue; }
+             #special { color: green; }
+             * { margin: 0; }
+             div.page#content { padding: 1px; }
+             div p { font-size: 10px; }
+             div > span { font-size: 11px; }
+             p + span { font-weight: bold; }
+             p ~ span { font-style: italic; }
+             em:not(.x) { color: black; }
+             :is(.warn, em) { outline: none; }
+             p:first-child, .warn { text-align: left; }
+             p::before { content: 'a'; }
+             .note::after { content: 'b'; }
+             span:nth-child(2n) { color: gray; }",
+        );
+        let viewport = ViewportSize::DEFAULT_DESKTOP;
+        let mut flat: Vec<(Origin, usize, StyleRule)> = Vec::new();
+        let mut order = 0usize;
+        flatten_rules(&sheet.rules, Origin::Author, viewport, &mut flat, &mut order);
+        let flat_refs: Vec<(Origin, usize, &StyleRule)> =
+            flat.iter().map(|(o, n, r)| (*o, *n, r)).collect();
+        let index = RuleIndex::build(&flat_refs);
+
+        let mut checked_any = false;
+        for &node in &nodes {
+            if doc.element(node).is_none() {
+                continue;
+            }
+            let indexed = matched_rules(&doc, node, &index);
+            let brute = matched_rules_bruteforce(&doc, node, &flat_refs);
+            assert_eq!(indexed, brute, "divergence at node {node:?}");
+            checked_any = checked_any || !brute.is_empty();
+        }
+        assert!(checked_any, "test must actually match some rules");
+    }
 
     fn build(html_like: &str) -> (Document, NodeId) {
         // Minimal hand-built tree for tests.
