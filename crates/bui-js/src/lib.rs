@@ -27,6 +27,8 @@ pub mod events;
 pub use dom_bindings::{BindingContext, FetchResponse, Fetcher};
 pub use events::Event;
 
+use zinc::runtime::value::Value;
+
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -310,7 +312,67 @@ impl JsContext {
         // opportunity right after the script pass.
         let root = ctx.doc.lock().unwrap().root;
         let _ = ctx.dispatch(Event::new("load", root));
+        // Deliver any fetch() results that already completed during
+        // the script pass (and the immediate rejections of a
+        // fetcher-less embedder) before handing the context back.
+        ctx.deliver_fetch_completions();
         (ctx, outcomes)
+    }
+
+    /// Settle the promises of background `fetch()` calls whose
+    /// network work finished. Runs on the engine thread; reaction
+    /// callbacks fire via the microtask drain that follows.
+    fn deliver_fetch_completions(&mut self) {
+        let done = self.bindings.take_fetch_completions();
+        if done.is_empty() {
+            return;
+        }
+        let delivered = done.len();
+        let vm = self.engine.vm();
+        for (pid, result) in done {
+            match result {
+                Some(resp) => {
+                    let ok = (200..300).contains(&resp.status);
+                    let obj = vm.alloc_object();
+                    vm.set_property(obj, "ok", Value::boolean(ok));
+                    vm.set_property(obj, "status", Value::int(resp.status as i32));
+                    let url_v = vm.value_from_str(&resp.url);
+                    vm.set_property(obj, "url", url_v);
+                    let body = String::from_utf8_lossy(&resp.body).into_owned();
+                    let body_v = vm.value_from_str(&body);
+                    vm.set_property(obj, "body", body_v);
+                    vm.host_promise_resolve(pid, obj);
+                }
+                None => {
+                    let reason = vm.value_from_str("fetch: network error");
+                    vm.host_promise_reject(pid, reason);
+                }
+            }
+        }
+        self.bindings.fetch_delivered(delivered);
+        let _ = self.engine.vm().drain_microtasks();
+        self.deliver_mutations();
+    }
+
+    /// Background `fetch()` calls whose results JS hasn't observed
+    /// yet. Sync embedder paths (CLI rendering) poll this to settle
+    /// scripts before styling.
+    pub fn pending_fetches(&self) -> usize {
+        self.bindings.fetch_pending()
+    }
+
+    /// Evaluate a script in the page's engine and return the result's
+    /// string form. Test / debug surface.
+    pub fn eval(&mut self, src: &str) -> String {
+        let (result, _) = self.engine.eval_with_output(src);
+        result
+    }
+
+    /// Install the embedder wakeup used when a background fetch
+    /// completes (typically: wake the UI event loop so the next tick
+    /// settles the promise). No-op when already set.
+    pub fn ensure_wake_hook(&self, hook: &std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.bindings.ensure_fetch_wake(hook);
     }
 
     /// Dispatch a synthetic event through the registered JS
@@ -511,6 +573,9 @@ impl JsContext {
     /// so this loop never needs to consult a separate set of
     /// cancellations.
     pub fn tick(&mut self, now: std::time::Instant) {
+        // Settle completed background fetches first — their .then
+        // callbacks run in the microtask drains below, same frame.
+        self.deliver_fetch_completions();
         let due: Vec<crate::dom_bindings::ScheduledTimer> = {
             let timers = self.bindings.timers();
             let mut t = timers.lock().unwrap();

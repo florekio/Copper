@@ -1622,12 +1622,33 @@ impl TabState {
         // (stylesheets, images) append into the same global buffer.
         clear_net_capture();
         let html = fetch_html_text(url)?;
-        let booted = boot_page(url, &html);
+        let mut booted = boot_page(url, &html);
         // If a boot script set `window.location.href`, follow the
         // redirect by recursing once into `TabState::fetch`; chains
         // bound themselves by call depth.
         if let Some(next_url) = booted.redirect.clone() {
             return TabState::fetch(&next_url);
+        }
+        // JS fetch() is asynchronous now. This synchronous path (CLI
+        // rendering, internal pages) has no event loop to tick later,
+        // so settle in-flight fetches before styling — bounded, and
+        // free for pages that never call fetch.
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while booted.js_ctx.pending_fetches() > 0 && std::time::Instant::now() < settle_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            booted.js_ctx.tick(std::time::Instant::now());
+        }
+        for line in booted.js_ctx.take_console_lines() {
+            eprintln!("[js] {line}");
+            booted.console_log.push(line);
+        }
+        // A settled fetch handler may itself have navigated.
+        if let Some(target) = booted.js_ctx.take_pending_navigation() {
+            if let Ok(next_url) = url.join(&target) {
+                if next_url.to_string() != url.to_string() {
+                    return TabState::fetch(&next_url);
+                }
+            }
         }
         let (sources, (img_by_url, img_urls), favicon_href) = {
             let d = booted.doc.lock().unwrap();
@@ -2093,6 +2114,10 @@ struct BrowserState {
     /// with the sleeper threads that fire it. Without this, page
     /// timers only ran when user input happened to cause a repaint.
     timer_wakeup: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Wakeup handed to each page's JS context so a completed
+    /// background fetch() ticks the loop promptly. Built once when
+    /// the Redrawer arrives in on_proxy.
+    js_wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Dev-dock panel selector. The dock is always one of three live
@@ -2137,6 +2162,7 @@ impl BrowserState {
             load_tx,
             load_rx,
             timer_wakeup: Arc::new(Mutex::new(None)),
+            js_wake: None,
         }
     }
 
@@ -2562,6 +2588,8 @@ fn run_browser(initial_url: &str) -> ExitCode {
         .on_cursor(move |viewport| cursor_for(&cursor_state, viewport))
         .on_proxy(move |redrawer| {
             let mut st = proxy_state.lock().unwrap();
+            let wake_redrawer = redrawer.clone();
+            st.js_wake = Some(Arc::new(move || wake_redrawer.request_redraw()));
             st.redrawer = Some(redrawer);
             // External first page: start its async load now that the
             // loop can be woken. The window paints the placeholder
@@ -2629,9 +2657,15 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
     // (common pattern: `setTimeout(() => location.href = url,
     // 500)`) actually navigate instead of stalling until the
     // next user input.
+    let js_wake = st.js_wake.clone();
     let (pending_nav, next_timer): (Option<String>, Option<std::time::Instant>) = {
         let tab = st.active_tab_mut();
         if let Some(ctx) = tab.js_ctx.as_mut() {
+            // Completed background fetch() calls must wake the loop;
+            // idempotent, covers tabs created on any load path.
+            if let Some(hook) = &js_wake {
+                ctx.ensure_wake_hook(hook);
+            }
             ctx.tick(std::time::Instant::now());
             for line in ctx.take_console_lines() {
                 eprintln!("[js] {line}");

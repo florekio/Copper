@@ -36,11 +36,12 @@
 //! finish to decide whether the layout pipeline needs to re-run.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bui_dom::{Document, NodeId, NodeKind};
 use zinc::engine::{Engine, HostTag};
+use zinc::runtime::object::ObjectId;
 use zinc::runtime::value::Value;
 
 use crate::events::{EVT_FLAG_DEFAULT_PREVENTED, EVT_FLAG_STOP_PROPAGATION};
@@ -546,6 +547,18 @@ pub struct BindingContext {
     prevent_default_fn: Value,
     /// JS Value of the global `__eventStopPropagation` host fn.
     stop_propagation_fn: Value,
+    /// Background `fetch()` results awaiting delivery: the pinned
+    /// promise handle + the network outcome (`None` = network error,
+    /// delivered as a rejection). Pushed from fetch worker threads;
+    /// drained on the engine thread by `JsContext::tick`.
+    fetch_completions: Arc<Mutex<Vec<(ObjectId, Option<FetchResponse>)>>>,
+    /// Count of fetches started but not yet *delivered* to JS —
+    /// in-flight network work plus queued completions. Lets sync
+    /// embedder paths settle scripts before styling.
+    fetch_inflight: Arc<AtomicUsize>,
+    /// Embedder wakeup invoked when a background fetch completes, so
+    /// the event loop ticks promptly instead of waiting for input.
+    fetch_wake: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 impl BindingContext {
@@ -1931,38 +1944,48 @@ impl BindingContext {
             Ok(Value::null())
         });
 
-        // ---- Synchronous fetch ----
+        // ---- Asynchronous fetch ----
         //
-        // `__fetch_sync(url)` blocks on the embedder-supplied
-        // fetcher, returns a JS object the prelude's `fetch`
-        // wrapper turns into a Response-shaped thenable. No
-        // promises yet — Phase 4's contract is "fetch(url).then(r
-        // => …)" works synchronously, which is enough for the
-        // submit-then-render pattern Google's homepage uses.
+        // `__fetch_start(url)` returns a *pending* promise and runs
+        // the embedder-supplied fetcher on a background thread, so
+        // page scripts calling `fetch()` never block the engine
+        // thread. The worker pushes the outcome into
+        // `fetch_completions`; `JsContext::tick` (and the tail of
+        // `install_and_run`) resolves/rejects the promise on the
+        // engine thread and drains the resulting microtasks. The
+        // prelude's `fetch` wrapper layers the Response surface
+        // (.text() / .json() returning promises) on top.
+        let fetch_completions: Arc<Mutex<Vec<(ObjectId, Option<FetchResponse>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let fetch_inflight: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let fetch_wake: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
         let fetcher_for_fn = fetcher.clone();
-        engine.register_host_fn("__fetch_sync", move |vm, _this, args| {
+        let completions_for_fn = fetch_completions.clone();
+        let inflight_for_fn = fetch_inflight.clone();
+        let wake_for_fn = fetch_wake.clone();
+        engine.register_host_fn("__fetch_start", move |vm, _this, args| {
             let url = read_str(vm, args.first()).unwrap_or_default();
-            let obj = vm.alloc_object();
-            // Default response shape — populated below if the fetch
-            // succeeds.
-            vm.set_property(obj, "ok", Value::boolean(false));
-            vm.set_property(obj, "status", Value::int(0));
-            let empty = vm.value_from_str("");
-            vm.set_property(obj, "url", empty);
-            vm.set_property(obj, "body", empty);
-            if let Some(ref f) = fetcher_for_fn {
-                if let Some(resp) = f(&url) {
-                    let ok = (200..300).contains(&resp.status);
-                    vm.set_property(obj, "ok", Value::boolean(ok));
-                    vm.set_property(obj, "status", Value::int(resp.status as i32));
-                    let url_v = vm.value_from_str(&resp.url);
-                    vm.set_property(obj, "url", url_v);
-                    let body = String::from_utf8_lossy(&resp.body).into_owned();
-                    let body_v = vm.value_from_str(&body);
-                    vm.set_property(obj, "body", body_v);
+            let (pid, promise) = vm.host_promise_create();
+            inflight_for_fn.fetch_add(1, Ordering::SeqCst);
+            match fetcher_for_fn.clone() {
+                Some(f) => {
+                    let completions = completions_for_fn.clone();
+                    let wake = wake_for_fn.clone();
+                    std::thread::spawn(move || {
+                        let result = f(&url);
+                        completions.lock().unwrap().push((pid, result));
+                        let hook = wake.lock().unwrap().clone();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    });
                 }
+                // No fetcher (CLI / tests): immediate network-error
+                // rejection, delivered on the next completion pass.
+                None => completions_for_fn.lock().unwrap().push((pid, None)),
             }
-            Ok(obj)
+            Ok(promise)
         });
 
         // ---- Event flag mutators ----
@@ -2234,6 +2257,35 @@ impl BindingContext {
             timers,
             layout_frames,
             observers,
+            fetch_completions,
+            fetch_inflight,
+            fetch_wake,
+        }
+    }
+
+    /// Completed background fetches awaiting promise settlement.
+    /// Drained on the engine thread only.
+    pub(crate) fn take_fetch_completions(&self) -> Vec<(ObjectId, Option<FetchResponse>)> {
+        std::mem::take(&mut *self.fetch_completions.lock().unwrap())
+    }
+
+    /// Fetches started but not yet delivered to JS (in-flight network
+    /// work + queued completions).
+    pub(crate) fn fetch_pending(&self) -> usize {
+        self.fetch_inflight.load(Ordering::SeqCst)
+    }
+
+    /// Record that `n` completions were delivered to JS.
+    pub(crate) fn fetch_delivered(&self, n: usize) {
+        self.fetch_inflight.fetch_sub(n, Ordering::SeqCst);
+    }
+
+    /// Install the embedder wakeup invoked when a background fetch
+    /// completes. No-op if a hook is already set.
+    pub(crate) fn ensure_fetch_wake(&self, hook: &Arc<dyn Fn() + Send + Sync>) {
+        let mut slot = self.fetch_wake.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(hook.clone());
         }
     }
 
@@ -3454,17 +3506,13 @@ function __ael(type, listener, capture) {
         listener(e);
     }, capture === true);
 }
-// Synchronous fetch wrapper. __fetch_sync blocks on the embedder
-// fetcher and returns { ok, status, url, body }. We layer the
-// Response surface on top: text(), json(), and a thenable
-// .then/.catch/.finally chain that fires synchronously. No real
-// Promise — Zinc doesn't yet expose a Promise API to embedders
-// for host-resolved promises. Most fetch-using code in the wild
-// (Google's submit interceptor included) chains .then/.catch
-// without observing async, so a synchronous shim works.
-function fetch(url, _opts) {
-    var raw = __fetch_sync(url || '');
-    var resp = {
+// Asynchronous fetch. __fetch_start kicks the request off on a
+// background thread and returns a real pending Promise the host
+// settles with { ok, status, url, body } once the response lands
+// (or rejects on network error). We layer the standard Response
+// surface on top: text() / json() return promises of their own.
+function _makeFetchResponse(raw) {
+    return {
         ok: raw.ok,
         status: raw.status,
         statusText: raw.ok ? 'OK' : 'Error',
@@ -3474,37 +3522,17 @@ function fetch(url, _opts) {
         // convenient escape hatch and the test path uses it.
         body: raw.body,
         headers: { get: function(_n) { return null; }, has: function(_n) { return false; } },
-        text: function() {
-            var body = raw.body;
-            var done = false;
-            return {
-                then: function(cb) {
-                    if (!done) { done = true; cb(body); }
-                    return this;
-                },
-                catch: function() { return this; },
-                finally: function(cb) { cb(); return this; }
-            };
-        },
+        text: function() { return Promise.resolve(raw.body); },
         json: function() {
-            var parsed;
-            try { parsed = JSON.parse(raw.body); }
-            catch (e) { parsed = null; }
-            return {
-                then: function(cb) { cb(parsed); return this; },
-                catch: function() { return this; },
-                finally: function(cb) { cb(); return this; }
-            };
+            try { return Promise.resolve(JSON.parse(raw.body)); }
+            catch (e) { return Promise.reject(e); }
         }
     };
-    resp.then = function(cb) {
-        var r = cb(this);
-        if (r && typeof r.then === 'function') { return r; }
-        return this;
-    };
-    resp.catch = function() { return resp; };
-    resp.finally = function(cb) { cb(); return resp; };
-    return resp;
+}
+function fetch(url, _opts) {
+    return __fetch_start(url || '').then(function(raw) {
+        return _makeFetchResponse(raw);
+    });
 }
 document.addEventListener = __ael;
 document.removeEventListener = __noop;
@@ -4196,13 +4224,31 @@ mod tests {
     // `set_timeout_with_delay_fires_when_tick_passes_deadline`
     // and `clear_timeout_cancels_pending` tests in `tests::`.
 
+    /// Settle pending fetches by ticking until delivered (bounded).
+    fn settle_fetches(ctx: &mut crate::JsContext) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ctx.pending_fetches() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            ctx.tick(std::time::Instant::now());
+        }
+        assert_eq!(ctx.pending_fetches(), 0, "fetches never settled");
+    }
+
     #[test]
-    fn fetch_routes_through_embedder_supplied_fetcher() {
-        // Phase 4: a script calls fetch(url) and gets a Response
-        // object whose `.then(r => r.body)` synchronously sees the
-        // body the embedder fetcher returned.
-        let mut engine = Engine::new();
-        let doc = wrapped_doc("<body></body>");
+    fn fetch_resolves_asynchronously_through_embedder_fetcher() {
+        // A script calls fetch(url) and gets a real pending Promise:
+        // the network runs on a background thread and the .then chain
+        // fires once the embedder ticks the context.
+        let doc = wrapped_doc(
+            "<body><script>\
+                var captured = {};\
+                fetch('/api/x').then(function(r){ \
+                    captured.status = r.status; \
+                    captured.ok = r.ok; \
+                    captured.body = r.body; \
+                });\
+             </script></body>",
+        );
         let url_seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let url_for_fetcher = url_seen.clone();
         let fetcher: Fetcher = std::sync::Arc::new(move |u| {
@@ -4213,39 +4259,31 @@ mod tests {
                 body: br#"{"ok":true,"hello":"world"}"#.to_vec(),
             })
         });
-        let _ctx = BindingContext::install_with_fetcher(
-            &mut engine,
+        let (mut ctx, _) = crate::JsContext::install_and_run(
             doc,
             String::from("https://example.com/page"),
             Some(fetcher),
         );
+        settle_fetches(&mut ctx);
 
-        // Script: synchronous fetch + .then chain on the
-        // Response. We pull the status into a global, then the
-        // body via .text(), then check the JSON path also works.
-        engine
-            .eval(
-                "var captured = {};\
-                 fetch('/api/x').then(function(r){ \
-                     captured.status = r.status; \
-                     captured.ok = r.ok; \
-                     captured.body = r.body; \
-                 });",
-            )
-            .expect("eval");
-
-        let (status, _) = engine.eval_with_output("captured.status");
-        let (ok, _) = engine.eval_with_output("captured.ok");
-        let (body, _) = engine.eval_with_output("captured.body");
-        assert_eq!(status, "200");
-        assert_eq!(ok, "true");
+        assert_eq!(ctx.eval("captured.status"), "200");
+        assert_eq!(ctx.eval("captured.ok"), "true");
+        let body = ctx.eval("captured.body");
         assert!(body.contains("\"hello\":\"world\""), "body was {body:?}");
+        assert_eq!(url_seen.lock().unwrap().as_deref(), Some("/api/x"));
 
-        // And the embedder fetcher saw the URL.
-        assert_eq!(
-            url_seen.lock().unwrap().as_deref(),
-            Some("/api/x"),
+        // Promise chaining through r.json(): the second .then sees
+        // the parsed object (thenable adoption in the reaction).
+        ctx.eval(
+            "var jhello = null;\
+             fetch('/api/x').then(function(r){ return r.json(); })\
+                 .then(function(j){ jhello = j.hello; });",
         );
+        settle_fetches(&mut ctx);
+        // One more tick: the adopted json() promise resolves through
+        // an extra microtask hop.
+        ctx.tick(std::time::Instant::now());
+        assert_eq!(ctx.eval("jhello"), "world");
     }
 
     #[test]
@@ -4833,4 +4871,22 @@ mod tests {
         assert!(toks.contains("c"));
         assert!(!toks.contains("a"));
     }
+// temp probe — appended to dom_bindings tests
+#[test]
+fn install_does_not_block_on_slow_fetch() {
+    let doc = wrapped_doc(
+        "<body><script>fetch('/slow').then(function(r){});</script></body>",
+    );
+    let fetcher: Fetcher = std::sync::Arc::new(move |u| {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        Some(FetchResponse { status: 200, url: u.to_string(), body: b"{}".to_vec() })
+    });
+    let started = std::time::Instant::now();
+    let (_ctx, _) = crate::JsContext::install_and_run(
+        doc, String::from("https://example.com/"), Some(fetcher));
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_millis(500),
+        "install_and_run blocked {elapsed:?} on a slow fetch");
+}
+
 }
