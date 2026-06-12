@@ -60,6 +60,7 @@ impl Request {
 
         let mut has_ua = false;
         let mut has_accept = false;
+        let mut has_accept_encoding = false;
         let mut has_connection = false;
         for (k, v) in &self.headers {
             if k.eq_ignore_ascii_case("host") {
@@ -70,6 +71,9 @@ impl Request {
             }
             if k.eq_ignore_ascii_case("accept") {
                 has_accept = true;
+            }
+            if k.eq_ignore_ascii_case("accept-encoding") {
+                has_accept_encoding = true;
             }
             if k.eq_ignore_ascii_case("connection") {
                 has_connection = true;
@@ -82,6 +86,11 @@ impl Request {
         }
         if !has_accept {
             out.extend_from_slice(b"Accept: */*\r\n");
+        }
+        if !has_accept_encoding {
+            // gzip only — it's what Response::decode_content understands.
+            // Typically shrinks HTML/CSS/JS transfers 3-5x.
+            out.extend_from_slice(b"Accept-Encoding: gzip\r\n");
         }
         if !has_connection {
             // Single-shot fetch — close after response. Keep-alive lands later.

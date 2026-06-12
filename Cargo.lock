@@ -273,6 +273,7 @@ name = "bui-net"
 version = "0.1.1"
 dependencies = [
  "bui-url",
+ "flate2",
  "rustls",
  "thiserror 2.0.18",
  "tokio",

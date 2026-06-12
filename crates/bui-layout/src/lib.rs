@@ -4392,28 +4392,25 @@ fn truncate_lines_with_ellipsis(lines: &mut Vec<LineBox>, container_w: f32) {
                     run.style.letter_spacing,
                 );
                 let max_w = (line_right_max - run.frame.x - ell_w).max(0.0);
-                let mut chars: Vec<char> = run.text.chars().collect();
-                while !chars.is_empty() {
-                    let trial: String = chars.iter().collect();
-                    let w = font.measure_text_with_spacing(
-                        &trial,
-                        run.style.font_size,
-                        run.style.letter_spacing,
-                    );
-                    if w <= max_w {
+                // Longest prefix that fits, via a running width — text
+                // width is a plain per-char advance sum (no kerning),
+                // so prefixes are additive. The old pop-one-char-and-
+                // re-measure loop was O(n²) on long overflowing runs.
+                let mut width = 0.0;
+                let mut keep_bytes = 0;
+                for (i, c) in run.text.char_indices() {
+                    let adv = font.glyph_advance(c, run.style.font_size)
+                        + run.style.letter_spacing;
+                    if width + adv > max_w {
                         break;
                     }
-                    chars.pop();
+                    width += adv;
+                    keep_bytes = i + c.len_utf8();
                 }
-                let mut truncated: String = chars.iter().collect();
+                let mut truncated = run.text[..keep_bytes].to_string();
                 truncated.push_str(ellipsis);
-                let new_w = font.measure_text_with_spacing(
-                    &truncated,
-                    run.style.font_size,
-                    run.style.letter_spacing,
-                );
                 run.text = truncated;
-                run.frame.width = new_w;
+                run.frame.width = width + ell_w;
                 break;
             }
         }
@@ -4435,17 +4432,21 @@ fn break_word_chunks(
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
+    // Running chunk width instead of re-measuring the whole prefix per
+    // char (which made long unbroken words O(n²)). Exact: width is a
+    // per-char advance sum, so it accumulates.
+    let mut current_w = 0.0;
     let mut budget = (container_w - start_x).max(font_size); // never zero — guarantees progress
-    let chars: Vec<char> = text.chars().collect();
-    for c in chars {
-        let trial = format!("{current}{c}");
-        let w = font.measure_text_with_spacing(&trial, font_size, letter_spacing);
-        if w > budget && !current.is_empty() {
+    for c in text.chars() {
+        let adv = font.glyph_advance(c, font_size) + letter_spacing;
+        if current_w + adv > budget && !current.is_empty() {
             out.push(std::mem::take(&mut current));
             budget = container_w.max(font_size);
             current.push(c);
+            current_w = adv;
         } else {
-            current = trial;
+            current.push(c);
+            current_w += adv;
         }
     }
     if !current.is_empty() {

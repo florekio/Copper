@@ -516,7 +516,13 @@ fn collect_author_stylesheets(
         }
         false
     }
-    let mut sheets = Vec::new();
+    /// One stylesheet's origin, recorded in document order so the
+    /// cascade priority survives the parallel fetch below.
+    enum SheetSource {
+        Inline(String),
+        Remote(Url),
+    }
+    let mut sources: Vec<SheetSource> = Vec::new();
     let internal = base.is_internal();
     for nid in doc.descendants(doc.root) {
         let Some(elem) = doc.element(nid) else {
@@ -548,11 +554,7 @@ fn collect_author_stylesheets(
                     child = doc.node(c).next_sibling;
                 }
                 if !text.trim().is_empty() {
-                    let mut sheet = bui_css::Stylesheet::parse(&text);
-                    if !internal {
-                        inline_css_imports(base, &mut sheet);
-                    }
-                    sheets.push(sheet);
+                    sources.push(SheetSource::Inline(text));
                 }
             }
             "link" if !internal => {
@@ -589,11 +591,67 @@ fn collect_author_stylesheets(
                         continue;
                     }
                 };
-                if let Some(sheet) = fetch_and_parse_stylesheet(&url) {
-                    sheets.push(sheet);
-                }
+                sources.push(SheetSource::Remote(url));
             }
             _ => {}
+        }
+    }
+
+    // Fetch all remote sheets concurrently (they used to go one-by-one,
+    // paying a full TLS round-trip each). Results come back keyed by
+    // their position in `sources` so document order is preserved.
+    let mut remote_css: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let remotes: Vec<(usize, Url)> = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| match s {
+            SheetSource::Remote(url) => Some((i, url.clone())),
+            SheetSource::Inline(_) => None,
+        })
+        .collect();
+    if !remotes.is_empty() {
+        let fetched: Vec<(usize, Option<String>)> = shared_runtime().block_on(async {
+            const MAX_INFLIGHT: usize = 6;
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, url) in remotes {
+                let permits = permits.clone();
+                set.spawn(async move {
+                    let _permit = permits.acquire_owned().await.ok();
+                    (idx, fetch_stylesheet_text(&url).await)
+                });
+            }
+            let mut out = Vec::new();
+            while let Some(joined) = set.join_next().await {
+                if let Ok(pair) = joined {
+                    out.push(pair);
+                }
+            }
+            out
+        });
+        for (idx, css) in fetched {
+            if let Some(css) = css {
+                remote_css.insert(idx, css);
+            }
+        }
+    }
+
+    let mut sheets = Vec::new();
+    for (idx, source) in sources.into_iter().enumerate() {
+        match source {
+            SheetSource::Inline(text) => {
+                let mut sheet = bui_css::Stylesheet::parse(&text);
+                if !internal {
+                    inline_css_imports(base, &mut sheet);
+                }
+                sheets.push(sheet);
+            }
+            SheetSource::Remote(url) => {
+                let Some(css) = remote_css.remove(&idx) else { continue };
+                let mut sheet = bui_css::Stylesheet::parse(&css);
+                inline_css_imports(&url, &mut sheet);
+                sheets.push(sheet);
+            }
         }
     }
     sheets
@@ -645,21 +703,20 @@ fn maybe_rewrite_google_search(url: &Url) -> Url {
     url.clone()
 }
 
-/// Fetch a CSS URL, parse it, and inline any `@import` rules in
-/// place so the cascade sees a single flattened rule list.
-fn fetch_and_parse_stylesheet(url: &Url) -> Option<bui_css::Stylesheet> {
-    // 8-second timeout — Wikipedia loads many <link> CSS references;
-    // a single slow / 429-stuck mirror can stall the whole page if
-    // we wait indefinitely. Treat timeout as parse-error so the rest
-    // of the cascade still applies.
+/// Fetch a CSS URL's text. Parsing + `@import` inlining happen at the
+/// caller so multiple sheets can be fetched concurrently.
+///
+/// 8-second timeout — Wikipedia loads many <link> CSS references;
+/// a single slow / 429-stuck mirror can stall the whole page if
+/// we wait indefinitely. Treat timeout as parse-error so the rest
+/// of the cascade still applies.
+async fn fetch_stylesheet_text(url: &Url) -> Option<String> {
     let started = std::time::Instant::now();
-    let fetch = shared_runtime().block_on(async {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            shared_client().get(url),
-        )
-        .await
-    });
+    let fetch = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        shared_client().get(url),
+    )
+    .await;
     let elapsed_ms = started.elapsed().as_millis() as u32;
     let resp = match fetch {
         Err(_) => {
@@ -679,10 +736,7 @@ fn fetch_and_parse_stylesheet(url: &Url) -> Option<bui_css::Stylesheet> {
         eprintln!("css {url}: HTTP {} (skipping)", resp.status);
         return None;
     }
-    let css = String::from_utf8_lossy(&resp.body);
-    let mut sheet = bui_css::Stylesheet::parse(&css);
-    inline_css_imports(url, &mut sheet);
-    Some(sheet)
+    Some(String::from_utf8_lossy(&resp.body).into_owned())
 }
 
 /// Replace every `@import url(...)` rule in `sheet` with the rules
@@ -1033,16 +1087,45 @@ fn resolve_and_preload_background_images(base: &Url, style: &mut bui_style::Styl
             }
         }
     }
-    for url in to_fetch {
-        if let Some(image) = fetch_and_decode_image(&url) {
-            bui_gpu::enqueue_upload(url.to_string(), image);
+    if to_fetch.is_empty() {
+        return;
+    }
+    // Concurrent fetches with the same in-flight cap the <img> preload
+    // path uses — these used to download one-by-one.
+    let fetched: Vec<(String, Option<bui_image::Image>)> = shared_runtime().block_on(async {
+        const MAX_INFLIGHT: usize = 6;
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+        let mut set = tokio::task::JoinSet::new();
+        for url in to_fetch {
+            let permits = permits.clone();
+            set.spawn(async move {
+                let _permit = permits.acquire_owned().await.ok();
+                let image = fetch_and_decode_image_async(&url).await;
+                (url.to_string(), image)
+            });
+        }
+        let mut out = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(pair) = joined {
+                out.push(pair);
+            }
+        }
+        out
+    });
+    for (key, image) in fetched {
+        if let Some(image) = image {
+            bui_gpu::enqueue_upload(key, image);
         }
     }
 }
 
 fn fetch_and_decode_image(url: &Url) -> Option<bui_image::Image> {
+    shared_runtime().block_on(fetch_and_decode_image_async(url))
+}
+
+async fn fetch_and_decode_image_async(url: &Url) -> Option<bui_image::Image> {
     let started = std::time::Instant::now();
-    let resp = match shared_runtime().block_on(shared_client().get(url)) {
+    let resp = match shared_client().get(url).await {
         Ok(r) => r,
         Err(e) => {
             net_record("GET", url, 0, started.elapsed().as_millis() as u32, 0);
@@ -2213,7 +2296,7 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
     // the top bar's bottom rule visually crosses the sidebar's right
     // edge cleanly.
     if sidebar_w > 0.0 {
-        let sidebar_layout = build_sidebar_layout(h, &tabs_for_sidebar);
+        let sidebar_layout = build_sidebar_layout(h, tabs_for_sidebar.iter().map(|(_, u, _)| u));
         paint_sidebar(h, viewport.cursor, &tabs_for_sidebar, &sidebar_layout, &mut dl);
     }
 
@@ -2233,22 +2316,21 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         &mut dl,
     );
 
-    // Dev-dock (above the status line, when open).
+    // Dev-dock (above the status line, when open). Borrow the logs
+    // straight out of the tab — cloning them (source_html alone can be
+    // 100 KB+) every frame was pure allocator churn.
     if dock_h > 0.0 {
         let active_dock_tab = st.active_dock_tab;
-        let (net_log, console_log, source_html) = {
-            let tab = st.active_tab();
-            (tab.net_log.clone(), tab.console_log.clone(), tab.source_html.clone())
-        };
+        let tab = st.active_tab();
         paint_dock(
             w,
             h,
             sidebar_w,
             viewport.cursor,
             active_dock_tab,
-            &net_log,
-            &console_log,
-            &source_html,
+            &tab.net_log,
+            &tab.console_log,
+            &tab.source_html,
             &mut dl,
         );
     }
@@ -2404,15 +2486,15 @@ struct SidebarLayout {
     rows: Vec<(usize, Rect, Rect)>,
 }
 
-fn build_sidebar_layout(
+fn build_sidebar_layout<'a>(
     height: f32,
-    tabs: &[(String, Url, bool)],
+    tab_urls: impl Iterator<Item = &'a Url>,
 ) -> SidebarLayout {
-    let mut rows = Vec::with_capacity(tabs.len());
+    let mut rows = Vec::new();
     let mut y = SIDEBAR_TOP_INSET + SIDEBAR_HEADER_FONT + 8.0; // header + gap
     // Group tabs by host, preserving source order inside each group.
     let mut current_group: Option<String> = None;
-    for (i, (_title, url, _active)) in tabs.iter().enumerate() {
+    for (i, url) in tab_urls.enumerate() {
         let key = tab_group_key(url);
         if current_group.as_deref() != Some(key.as_str()) {
             if current_group.is_some() {
@@ -3307,18 +3389,26 @@ const TOP_BAR_ACTION_HEIGHT: f32 = 24.0;
 const TOP_BAR_ACTION_GAP: f32 = 6.0;
 const TOP_BAR_ACTION_PAD_X: f32 = 8.0;
 
-fn top_bar_action_widths() -> Vec<f32> {
-    let font = bui_text::shared_font();
-    TOP_BAR_ACTIONS
-        .iter()
-        .map(|label| font.measure_text(label, TOP_BAR_ACTION_FONT) + TOP_BAR_ACTION_PAD_X * 2.0)
-        .collect()
+fn top_bar_action_widths() -> &'static [f32] {
+    // Labels and font size are compile-time constants — measure once.
+    // This runs in every paint AND every cursor-move hit-test.
+    static WIDTHS: OnceLock<Vec<f32>> = OnceLock::new();
+    WIDTHS.get_or_init(|| {
+        let font = bui_text::shared_font();
+        TOP_BAR_ACTIONS
+            .iter()
+            .map(|label| font.measure_text(label, TOP_BAR_ACTION_FONT) + TOP_BAR_ACTION_PAD_X * 2.0)
+            .collect()
+    })
 }
 
 fn top_bar_actions_total_width() -> f32 {
-    let widths = top_bar_action_widths();
-    let n = widths.len() as f32;
-    widths.iter().sum::<f32>() + (n - 1.0).max(0.0) * TOP_BAR_ACTION_GAP
+    static TOTAL: OnceLock<f32> = OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        let widths = top_bar_action_widths();
+        let n = widths.len() as f32;
+        widths.iter().sum::<f32>() + (n - 1.0).max(0.0) * TOP_BAR_ACTION_GAP
+    })
 }
 
 fn address_bar_rect(width: u32, sidebar_w: f32) -> Rect {
@@ -3734,16 +3824,11 @@ fn cursor_for(state: &Arc<Mutex<BrowserState>>, viewport: Viewport) -> CursorIco
     let st = state.lock().unwrap();
     let (cx, cy) = viewport.cursor;
     let sidebar_w = st.sidebar_w();
-    // Sidebar region (left strip): tab rows = pointer.
+    // Sidebar region (left strip): tab rows = pointer. Layout geometry
+    // only needs the URLs (for host grouping) — no per-move clones.
     if cx < sidebar_w {
-        let tabs_for_sidebar: Vec<(String, Url, bool)> = st
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.title.clone(), t.url.clone(), i == st.active))
-            .collect();
         let h = viewport.height as f32;
-        let sl = build_sidebar_layout(h, &tabs_for_sidebar);
+        let sl = build_sidebar_layout(h, st.tabs.iter().map(|t| &t.url));
         for (_, row, _) in &sl.rows {
             if rect_contains(*row, (cx, cy)) {
                 return CursorIcon::Pointer;
@@ -3840,14 +3925,8 @@ fn handle_click(
         if st.address_input.focused {
             st.address_input.blur();
         }
-        let tabs_for_sidebar: Vec<(String, Url, bool)> = st
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.title.clone(), t.url.clone(), i == st.active))
-            .collect();
         let h = viewport.height as f32;
-        let sl = build_sidebar_layout(h, &tabs_for_sidebar);
+        let sl = build_sidebar_layout(h, st.tabs.iter().map(|t| &t.url));
         for (idx, row, close_rect) in &sl.rows {
             if rect_contains(*close_rect, (x, y)) {
                 st.active = *idx;
@@ -4670,7 +4749,7 @@ mod tests {
                 false,
             ),
         ];
-        let sl = build_sidebar_layout(800.0, &tabs);
+        let sl = build_sidebar_layout(800.0, tabs.iter().map(|(_, u, _)| u));
         assert_eq!(sl.rows.len(), 3);
         // Active tab (index 1) is on the same host as tab 0 so it
         // sits in the same group; tab 2 is on a different host so a

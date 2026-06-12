@@ -63,6 +63,11 @@ pub struct Font {
     /// backend reports a typical advance via `lookup_average_advance`).
     pub native_size: f32,
     backend: Backend,
+    /// char → (chain index, glyph id) resolved through the fallback
+    /// chain. `font_for_char` runs for every measured glyph, and the
+    /// uncached version re-parsed every FontRef in the chain per call.
+    /// Shared across clones (Arc), like the per-font advance caches.
+    char_font_cache: std::sync::Arc<Mutex<HashMap<char, (usize, u32)>>>,
 }
 
 #[derive(Clone)]
@@ -123,6 +128,7 @@ impl Font {
             family: "bui-bitmap".to_string(),
             native_size: CELL_H as f32,
             backend: Backend::Bitmap,
+            char_font_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -164,6 +170,7 @@ impl Font {
                 native_metrics,
                 advance_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             }]),
+            char_font_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -192,6 +199,9 @@ impl Font {
             native_metrics,
             advance_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         };
+        // The chain changed — cached (0, .notdef) resolutions may now
+        // resolve into the new fallback, so drop them.
+        self.char_font_cache.lock().unwrap().clear();
         if let Backend::Ttf(chain) = &mut self.backend {
             chain.push(entry);
             true
@@ -361,6 +371,10 @@ impl Font {
         let Backend::Ttf(chain) = &self.backend else {
             return (0, 0);
         };
+        if let Some(hit) = self.char_font_cache.lock().unwrap().get(&ch).copied() {
+            return hit;
+        }
+        let mut resolved = (0, 0);
         for (idx, t) in chain.iter().enumerate() {
             let Ok(font_ref) = FontRef::from_index(t.blob.data(), t.index) else {
                 continue;
@@ -368,11 +382,13 @@ impl Font {
             if let Some(gid) = font_ref.charmap().map(ch) {
                 let g = gid.to_u32();
                 if g != 0 {
-                    return (idx, g);
+                    resolved = (idx, g);
+                    break;
                 }
             }
         }
-        (0, 0)
+        self.char_font_cache.lock().unwrap().insert(ch, resolved);
+        resolved
     }
 
     /// Number of fonts in the chain (1 for a single-TTF setup, more

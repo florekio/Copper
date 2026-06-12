@@ -7,6 +7,9 @@ publish.workspace = true
 
 [dependencies]
 bui-url = { path = "../bui-url" }
+# Response body decompression (gzip). Already in the lockfile via
+# bui-image's png stack, so this adds no new transitive deps.
+flate2 = "1"
 tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

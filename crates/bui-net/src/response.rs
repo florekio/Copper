@@ -51,6 +51,7 @@ impl Response {
         }
 
         let body = read_body(reader, &headers, status).await?;
+        let body = decode_content(body, &headers)?;
 
         Ok(Response {
             status,
@@ -58,6 +59,34 @@ impl Response {
             headers,
             body,
         })
+    }
+}
+
+/// Undo Content-Encoding. We advertise only `gzip` in requests, so
+/// that's the only coding we decode; `identity` (or no header) passes
+/// through. Runs after body framing (chunked / content-length), per
+/// RFC 9110 §8.4 layering.
+fn decode_content(body: Vec<u8>, headers: &[(String, String)]) -> Result<Vec<u8>, NetError> {
+    let Some(encoding) = header_lower(headers, "content-encoding") else {
+        return Ok(body);
+    };
+    let encoding = encoding.trim().to_ascii_lowercase();
+    match encoding.as_str() {
+        "" | "identity" => Ok(body),
+        "gzip" | "x-gzip" => {
+            use std::io::Read as _;
+            // MultiGzDecoder: some servers emit multiple gzip members.
+            let mut out = Vec::with_capacity(body.len() * 3);
+            flate2::read::MultiGzDecoder::new(body.as_slice())
+                .read_to_end(&mut out)
+                .map_err(|e| {
+                    NetError::MalformedHeader(format!("gzip body failed to decode: {e}"))
+                })?;
+            Ok(out)
+        }
+        other => Err(NetError::MalformedHeader(format!(
+            "unsupported Content-Encoding: {other}"
+        ))),
     }
 }
 
@@ -236,5 +265,57 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(raw.to_vec()));
         let resp = run(Response::read_from(&mut reader)).unwrap();
         assert_eq!(resp.header("X-Long"), Some("foo bar"));
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn decodes_gzip_with_content_length() {
+        let zipped = gzip(b"hello gzip world");
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            zipped.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&zipped);
+        let mut reader = BufReader::new(Cursor::new(raw));
+        let resp = run(Response::read_from(&mut reader)).unwrap();
+        assert_eq!(resp.body, b"hello gzip world");
+    }
+
+    #[test]
+    fn decodes_gzip_after_chunked_deframing() {
+        let zipped = gzip(b"chunked + gzip layering");
+        let (a, b) = zipped.split_at(zipped.len() / 2);
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in [a, b] {
+            raw.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            raw.extend_from_slice(part);
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+        let mut reader = BufReader::new(Cursor::new(raw));
+        let resp = run(Response::read_from(&mut reader)).unwrap();
+        assert_eq!(resp.body, b"chunked + gzip layering");
+    }
+
+    #[test]
+    fn identity_encoding_passes_through() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: 5\r\n\r\nhello";
+        let mut reader = BufReader::new(Cursor::new(raw.to_vec()));
+        let resp = run(Response::read_from(&mut reader)).unwrap();
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[test]
+    fn unknown_encoding_errors() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+        let mut reader = BufReader::new(Cursor::new(raw.to_vec()));
+        assert!(run(Response::read_from(&mut reader)).is_err());
     }
 }
