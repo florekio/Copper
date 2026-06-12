@@ -1518,6 +1518,11 @@ struct TabState {
     images: bui_layout::ImageRegistry,
     svgs: bui_layout::SvgRegistry,
     layout: Option<LayoutBox>,
+    /// Document-space display list painted from `layout`, cached so a
+    /// scroll/hover repaint only re-runs the translate-and-cull pass
+    /// instead of walking the whole layout tree again. Cleared
+    /// whenever `layout` is rebuilt.
+    page_dl: Option<DisplayList>,
     last_width: u32,
     /// URLs visited *before* the current page; pop to go back.
     history: Vec<Url>,
@@ -1745,6 +1750,7 @@ impl TabState {
                 images,
                 svgs,
                 layout: None,
+                page_dl: None,
                 last_width: 0,
                 history: Vec::new(),
                 forward: Vec::new(),
@@ -1780,6 +1786,7 @@ impl TabState {
         self.source_html = next.source_html;
         self.favicon_key = next.favicon_key;
         self.layout = None;
+        self.page_dl = None;
         self.last_width = 0;
         self.page_inputs.clear();
         self.focused_input = None;
@@ -2482,6 +2489,11 @@ fn run_browser(initial_url: &str) -> ExitCode {
 // ---- rendering ----
 
 fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayList {
+    // COPPER_FRAME_LOG=1: print per-frame scene-build time + command
+    // count to stderr. Dev-only instrumentation for paint perf work.
+    static FRAME_LOG: OnceLock<bool> = OnceLock::new();
+    let frame_log = *FRAME_LOG.get_or_init(|| std::env::var("COPPER_FRAME_LOG").is_ok_and(|v| v == "1"));
+    let frame_started = frame_log.then(std::time::Instant::now);
     let mut dl = DisplayList::new();
     let w = viewport.width as f32;
     let h = viewport.height as f32;
@@ -2630,12 +2642,19 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
                 ctx.publish_layout_frames(frames);
             }
             tab.layout = Some(bx);
+            tab.page_dl = None;
             tab.last_width = viewport.width;
         }
     }
 
     let scroll_y = st.active_tab().scroll_y;
-    if let Some(bx) = &st.active_tab().layout {
+    // Build (or reuse) the document-space display list for the page.
+    // Walking the layout tree costs O(document); the cache makes a
+    // scroll/hover repaint pay only for the translate-and-cull pass
+    // below, which is bounded by what's actually visible.
+    if st.active_tab().layout.is_some() && st.active_tab().page_dl.is_none() {
+        let tab = st.active_tab_mut();
+        let bx = tab.layout.as_ref().expect("checked above");
         let mut page_dl = DisplayList::new();
         bui_layout::paint(bx, &mut page_dl);
         // Empty-body fallback. Some pages (Google /search,
@@ -2660,7 +2679,24 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         if !has_text {
             page_dl = build_empty_body_fallback(viewport_w_px, &active_url);
         }
+        tab.page_dl = Some(page_dl);
+    }
+    if let Some(bx) = &st.active_tab().layout {
+        let page_dl = st
+            .active_tab()
+            .page_dl
+            .as_ref()
+            .expect("page_dl built above whenever layout exists");
         let base_dy = CHROME_HEIGHT - scroll_y;
+        // Vertical band the page surface occupies. Commands whose
+        // translated geometry lands fully outside it are skipped — on
+        // a tall page that culls the overwhelming majority of the
+        // document, so frame cost tracks the viewport, not the page
+        // height. Clip / sticky brackets always pass through so their
+        // stacks stay balanced.
+        let band_top = CHROME_HEIGHT;
+        let band_bottom = h - STATUS_HEIGHT - dock_h;
+        let band_visible = |top: f32, bottom: f32| bottom >= band_top && top <= band_bottom;
         // `position: sticky` defers its shift to here: bui-layout
         // emitted PushStickyGroup / PopStickyGroup bracket commands
         // with the box's natural_y, top_edge, and range_bottom. For
@@ -2670,36 +2706,50 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         // scrolls past it. The stack supports nested stickies; pop
         // returns to the parent's dy.
         let mut sticky_dy_stack: Vec<f32> = Vec::new();
-        for cmd in page_dl.commands {
+        for cmd in &page_dl.commands {
             let dy = *sticky_dy_stack.last().unwrap_or(&base_dy);
             match cmd {
                 PaintCommand::FillRect { rect, color } => {
+                    if !band_visible(rect.y + dy, rect.y + dy + rect.h) {
+                        continue;
+                    }
                     dl.commands.push(PaintCommand::FillRect {
                         rect: Rect::new(rect.x, rect.y + dy, rect.w, rect.h),
-                        color,
+                        color: *color,
                     });
                 }
                 PaintCommand::FillRoundedRect { rect, color, radii } => {
+                    if !band_visible(rect.y + dy, rect.y + dy + rect.h) {
+                        continue;
+                    }
                     dl.commands.push(PaintCommand::FillRoundedRect {
                         rect: Rect::new(rect.x, rect.y + dy, rect.w, rect.h),
-                        color,
-                        radii,
+                        color: *color,
+                        radii: *radii,
                     });
                 }
                 PaintCommand::FillPath { points, color } => {
-                    let translated = points
-                        .into_iter()
-                        .map(|(x, y)| (x, y + dy))
-                        .collect();
+                    let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+                    for &(_, y) in points {
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                    }
+                    if !band_visible(min_y + dy, max_y + dy) {
+                        continue;
+                    }
+                    let translated = points.iter().map(|&(x, y)| (x, y + dy)).collect();
                     dl.commands.push(PaintCommand::FillPath {
                         points: translated,
-                        color,
+                        color: *color,
                     });
                 }
                 PaintCommand::Image { rect, key } => {
+                    if !band_visible(rect.y + dy, rect.y + dy + rect.h) {
+                        continue;
+                    }
                     dl.commands.push(PaintCommand::Image {
                         rect: Rect::new(rect.x, rect.y + dy, rect.w, rect.h),
-                        key,
+                        key: key.clone(),
                     });
                 }
                 PaintCommand::Text {
@@ -2710,27 +2760,37 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
                     color,
                     content,
                 } => {
+                    // Glyphs extend roughly one em above the baseline
+                    // and ~0.4 em below — conservative bounds so a run
+                    // straddling the band edge always paints.
+                    if !band_visible(baseline + dy - font_size * 1.2, baseline + dy + font_size * 0.5)
+                    {
+                        continue;
+                    }
                     dl.commands.push(PaintCommand::Text {
-                        x,
+                        x: *x,
                         baseline: baseline + dy,
-                        advance,
-                        font_size,
-                        color,
-                        content,
+                        advance: *advance,
+                        font_size: *font_size,
+                        color: *color,
+                        content: content.clone(),
                     });
                 }
                 PaintCommand::BoxShadow { rect, color, radius, blur } => {
+                    if !band_visible(rect.y + dy - blur * 2.0, rect.y + dy + rect.h + blur * 2.0) {
+                        continue;
+                    }
                     dl.commands.push(PaintCommand::BoxShadow {
                         rect: Rect::new(rect.x, rect.y + dy, rect.w, rect.h),
-                        color,
-                        radius,
-                        blur,
+                        color: *color,
+                        radius: *radius,
+                        blur: *blur,
                     });
                 }
                 PaintCommand::PushClip { rect, radii } => {
                     dl.commands.push(PaintCommand::PushClip {
                         rect: Rect::new(rect.x, rect.y + dy, rect.w, rect.h),
-                        radii,
+                        radii: *radii,
                     });
                 }
                 PaintCommand::PopClip => {
@@ -2744,13 +2804,16 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
                     stroke,
                     stroke_width,
                 } => {
+                    if !band_visible(rect.y + dy, rect.y + dy + rect.h) {
+                        continue;
+                    }
                     dl.commands.push(PaintCommand::Svg {
                         rect: Rect::new(rect.x, rect.y + dy, rect.w, rect.h),
-                        view_box,
-                        segments,
-                        fill,
-                        stroke,
-                        stroke_width,
+                        view_box: *view_box,
+                        segments: segments.clone(),
+                        fill: *fill,
+                        stroke: *stroke,
+                        stroke_width: *stroke_width,
                     });
                 }
                 PaintCommand::PushStickyGroup {
@@ -2909,6 +2972,13 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
         &update_status,
         &mut dl,
     );
+    if let Some(started) = frame_started {
+        eprintln!(
+            "[frame] {:.2} ms, {} commands",
+            started.elapsed().as_secs_f64() * 1000.0,
+            dl.commands.len()
+        );
+    }
     dl
 }
 
@@ -4993,6 +5063,82 @@ fn char_index_at_x(font: &bui_text::Font, chars: &[char], font_size: f32, x: f32
 mod tests {
     use super::*;
 
+    /// The cached page display list + viewport culling must paint
+    /// exactly the content near the scroll position, keep clip
+    /// brackets balanced, and follow the scroll offset.
+    #[test]
+    fn paint_culls_offscreen_page_content() {
+        let mut html = String::from("<html><body>");
+        for i in 0..400 {
+            html.push_str(&format!("<p>para{i}marker</p>"));
+        }
+        html.push_str("</body></html>");
+        // No <link>/<img>/background-image → fully offline.
+        let url = Url::parse("https://example.com/tall").unwrap();
+        let booted = boot_page(&url, &html);
+        let (tab, bg) = TabState::finalize(
+            &url,
+            &html,
+            booted,
+            &[],
+            bui_layout::ImageRegistry::new(),
+            bui_layout::SvgRegistry::new(),
+            None,
+        );
+        assert!(bg.is_empty());
+        let state = Arc::new(Mutex::new(BrowserState::new(tab)));
+        let viewport = Viewport {
+            width: 800,
+            height: 600,
+            cursor: (-1.0, -1.0),
+        };
+
+        let visible_markers = |dl: &DisplayList| -> Vec<String> {
+            dl.commands
+                .iter()
+                .filter_map(|c| match c {
+                    PaintCommand::Text { content, .. } if content.contains("marker") => {
+                        Some(content.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let clip_balance = |dl: &DisplayList| -> i32 {
+            dl.commands.iter().fold(0, |acc, c| match c {
+                PaintCommand::PushClip { .. } => acc + 1,
+                PaintCommand::PopClip => acc - 1,
+                _ => acc,
+            })
+        };
+
+        // Top of the page: early paragraphs visible, late ones culled.
+        let dl_top = build_scene(viewport, &state);
+        let top = visible_markers(&dl_top);
+        assert!(top.iter().any(|t| t.contains("para0marker")), "{top:?}");
+        assert!(!top.iter().any(|t| t.contains("para399marker")));
+        assert!(
+            top.len() < 100,
+            "culling should drop most of 400 paragraphs, kept {}",
+            top.len()
+        );
+        assert_eq!(clip_balance(&dl_top), 0);
+
+        // Scrolled near the bottom: the situation reverses. This paint
+        // reuses the cached page_dl (layout unchanged).
+        {
+            let mut st = state.lock().unwrap();
+            let doc_h = st.active_tab().layout.as_ref().unwrap().frame.height;
+            st.active_tab_mut().scroll_y = (doc_h - 300.0).max(0.0);
+            assert!(st.active_tab().page_dl.is_some(), "cache built by first paint");
+        }
+        let dl_bottom = build_scene(viewport, &state);
+        let bottom = visible_markers(&dl_bottom);
+        assert!(bottom.iter().any(|t| t.contains("para399marker")), "{bottom:?}");
+        assert!(!bottom.iter().any(|t| t.contains("para0marker")));
+        assert_eq!(clip_balance(&dl_bottom), 0);
+    }
+
     /// Build a TabState from just title + URL — no fetch — for index-logic
     /// tests that don't care about real DOM contents.
     fn stub_tab(title: &str, url: &str) -> TabState {
@@ -5011,6 +5157,7 @@ mod tests {
             images: bui_layout::ImageRegistry::new(),
             svgs: bui_layout::SvgRegistry::new(),
             layout: None,
+            page_dl: None,
             last_width: 0,
             history: Vec::new(),
             forward: Vec::new(),
@@ -5062,6 +5209,7 @@ mod tests {
             images: bui_layout::ImageRegistry::new(),
             svgs: bui_layout::SvgRegistry::new(),
             layout: None,
+            page_dl: None,
             last_width: 0,
             history: Vec::new(),
             forward: Vec::new(),
