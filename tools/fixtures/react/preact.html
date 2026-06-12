@@ -1,0 +1,10 @@
+<html><head><title>Preact smoke</title></head><body>
+<div id="root"></div>
+<script src="preact.js"></script>
+<script>
+preact.render(preact.h('div', null,
+  preact.h('h1', null, 'PREACT-SMOKE-HEADING'),
+  preact.h('ul', null, preact.h('li', null, 'p-item-one'))),
+  document.getElementById('root'));
+</script>
+</body></html>

@@ -24,4 +24,10 @@ check() {
   fi
 }
 check 'REACT-SMOKE-HEADING' 'h1 rendered by ReactDOM'
+check 'item-alpha' 'first list item'
+check 'item-gamma' 'third list item'
+
+OUT=$(cargo run -q --bin copper -- layout "http://127.0.0.1:$PORT/preact.html" 2>/dev/null)
+check 'PREACT-SMOKE-HEADING' 'h1 rendered by Preact'
+check 'p-item-one' 'preact list item'
 if [ $fail -eq 0 ]; then echo "react_smoke: OK"; else echo "react_smoke: FAILED"; exit 1; fi

@@ -1698,6 +1698,51 @@ impl BindingContext {
         });
 
         let s = shared.clone();
+        let observers_for_insert = observers.clone();
+        let doc_for_insert = doc_for_observers.clone();
+        engine.register_host_fn("__elemInsertBefore", move |_vm, _this, args| {
+            let Some(parent_h) = args.first().copied() else {
+                return Ok(Value::undefined());
+            };
+            let Some(child_h) = args.get(1).copied() else {
+                return Ok(Value::undefined());
+            };
+            let dom = s.lock().unwrap();
+            let Some(parent) = dom.node_for_handle(parent_h) else {
+                return Ok(Value::undefined());
+            };
+            let Some(child) = dom.node_for_handle(child_h) else {
+                return Ok(Value::undefined());
+            };
+            // Third arg: reference node handle, or null/undefined for
+            // append (DOM insertBefore(child, null) semantics).
+            let reference = args
+                .get(2)
+                .copied()
+                .filter(|v| !v.is_null() && !v.is_undefined())
+                .and_then(|h| dom.node_for_handle(h));
+            {
+                let mut d = dom.doc_handle.lock().unwrap();
+                d.insert_before(parent, child, reference);
+            }
+            dom.mark_dirty();
+            drop(dom);
+            record_mutation(
+                &observers_for_insert,
+                &doc_for_insert,
+                MutationRecord {
+                    kind: MutationKind::ChildList,
+                    target: parent,
+                    attribute_name: String::new(),
+                    old_value: String::new(),
+                    added: vec![child],
+                    removed: Vec::new(),
+                },
+            );
+            Ok(child_h)
+        });
+
+        let s = shared.clone();
         let observers_for_rm = observers.clone();
         let doc_for_rm = doc_for_observers.clone();
         engine.register_host_fn("__elemRemoveChild", move |_vm, _this, args| {
@@ -2599,6 +2644,10 @@ function _wrapElem(handle) {
         },
         removeAttribute: function(name) {
             __elemRemoveAttr(this._h, name);
+        },
+        insertBefore: function(child, ref) {
+            __elemInsertBefore(this._h, child._h, ref ? ref._h : null);
+            return child;
         },
         appendChild: function(child) {
             if (child === null || child === undefined) return null;

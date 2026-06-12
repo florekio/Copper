@@ -178,6 +178,32 @@ impl Document {
         self.nodes[parent.index()].last_child = Some(child);
     }
 
+    /// Insert `child` into `parent` immediately before `reference`.
+    /// `None` reference appends (DOM `insertBefore(child, null)`
+    /// semantics). A reference that isn't a child of `parent` falls
+    /// back to append, mirroring the forgiving path most engines take
+    /// for detached references.
+    pub fn insert_before(&mut self, parent: NodeId, child: NodeId, reference: Option<NodeId>) {
+        let Some(reference) = reference else {
+            self.append_child(parent, child);
+            return;
+        };
+        if self.node(reference).parent != Some(parent) {
+            self.append_child(parent, child);
+            return;
+        }
+        self.detach(child);
+        let prev = self.node(reference).prev_sibling;
+        self.nodes[child.index()].parent = Some(parent);
+        self.nodes[child.index()].prev_sibling = prev;
+        self.nodes[child.index()].next_sibling = Some(reference);
+        self.nodes[reference.index()].prev_sibling = Some(child);
+        match prev {
+            Some(p) => self.nodes[p.index()].next_sibling = Some(child),
+            None => self.nodes[parent.index()].first_child = Some(child),
+        }
+    }
+
     /// Replace `parent`'s children with a single text node carrying
     /// `text`. Mirrors `Element.textContent =` setter semantics.
     /// Detaches each existing child (slots stay allocated but become
