@@ -1629,12 +1629,25 @@ impl TabState {
         if let Some(next_url) = booted.redirect.clone() {
             return TabState::fetch(&next_url);
         }
-        // JS fetch() is asynchronous now. This synchronous path (CLI
-        // rendering, internal pages) has no event loop to tick later,
-        // so settle in-flight fetches before styling — bounded, and
-        // free for pages that never call fetch.
+        // JS fetch() and timers are asynchronous. This synchronous path
+        // (CLI rendering, internal pages) has no event loop to tick
+        // later, so settle in-flight fetches AND already-due timers
+        // before styling — React-style schedulers chain setTimeout(0)
+        // to commit their work. Bounded, and free for pages that
+        // schedule nothing.
         let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while booted.js_ctx.pending_fetches() > 0 && std::time::Instant::now() < settle_deadline {
+        loop {
+            let now = std::time::Instant::now();
+            if now >= settle_deadline {
+                break;
+            }
+            let timer_due = booted
+                .js_ctx
+                .next_timer_deadline()
+                .is_some_and(|d| d <= now + std::time::Duration::from_millis(5));
+            if booted.js_ctx.pending_fetches() == 0 && !timer_due {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
             booted.js_ctx.tick(std::time::Instant::now());
         }

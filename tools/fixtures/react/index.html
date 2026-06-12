@@ -1,0 +1,14 @@
+<html><head><title>React smoke</title></head><body>
+<div id="root"></div>
+<script src="react.js"></script>
+<script src="react-dom.js"></script>
+<script>
+// Single-element tree: the proven-green milestone. Multi-child trees
+// (e('div', null, e('h1'), e('ul', ...))) still lose their Placement
+// flags + trip selection bookkeeping in commitBeforeMutationEffects —
+// that's the next engine/bindings milestone; extend this fixture when
+// it lands.
+var root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement('h1', null, 'REACT-SMOKE-HEADING'));
+</script>
+</body></html>

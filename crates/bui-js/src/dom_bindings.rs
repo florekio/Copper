@@ -3920,7 +3920,56 @@ window._rtf = __noop;
 window._xjs_toggles = [];
 window.loaded_h_0 = __noop;
 window.n = null;
-var self = window;
+// DOM interface constructors. Pages feature-detect and brand-check
+// against these (`el instanceof HTMLIFrameElement` in react-dom's
+// focus bookkeeping; `x instanceof Element` everywhere). Inert
+// functions are enough for instanceof to evaluate (to false) instead
+// of throwing "right-hand side is not callable"; real prototype
+// branding for wrapped elements is a follow-up.
+var EventTarget = function EventTarget() {};
+var Node = function Node() {};
+var Element = function Element() {};
+var Document = function Document() {};
+var HTMLDocument = function HTMLDocument() {};
+var DocumentFragment = function DocumentFragment() {};
+var Text = function Text() {};
+var Comment = function Comment() {};
+var HTMLElement = function HTMLElement() {};
+var SVGElement = function SVGElement() {};
+var HTMLIFrameElement = function HTMLIFrameElement() {};
+var HTMLInputElement = function HTMLInputElement() {};
+var HTMLTextAreaElement = function HTMLTextAreaElement() {};
+var HTMLSelectElement = function HTMLSelectElement() {};
+var HTMLOptionElement = function HTMLOptionElement() {};
+var HTMLButtonElement = function HTMLButtonElement() {};
+var HTMLAnchorElement = function HTMLAnchorElement() {};
+var HTMLImageElement = function HTMLImageElement() {};
+var HTMLFormElement = function HTMLFormElement() {};
+var HTMLSpanElement = function HTMLSpanElement() {};
+var HTMLDivElement = function HTMLDivElement() {};
+var MutationEvent = function MutationEvent() {};
+// In real browsers `window` IS the global object. The surface above
+// was built as a detached literal; graft it onto globalThis and
+// rebind, so `window === self === globalThis === this` holds and a
+// UMD bundle's `(global = global || self, factory(global.React = {}))`
+// creates a real global instead of writing into a void. (Strict-mode
+// IIFE wrappers get `this === undefined`, so they all reach for
+// `self` — React, Preact, and most CDN bundles ship exactly this.)
+(function () {
+    var keys = Object.keys(window);
+    for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (k === 'globalThis' || k === 'self' || k === 'top'
+            || k === 'parent' || k === 'frames') { continue; }
+        globalThis[k] = window[k];
+    }
+})();
+window = globalThis;
+var self = globalThis;
+window.self = globalThis;
+window.top = globalThis;
+window.parent = globalThis;
+window.frames = globalThis;
 "#;
 
 #[cfg(test)]
