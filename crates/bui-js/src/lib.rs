@@ -568,6 +568,15 @@ impl JsContext {
         self.deliver_mutations();
     }
 
+    /// Earliest pending timer deadline, if any. Lets the embedder
+    /// schedule an event-loop wakeup at the right moment instead of
+    /// relying on user input to trigger the tick that fires timers.
+    pub fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        let timers = self.bindings.timers();
+        let t = timers.lock().unwrap();
+        t.iter().map(|e| e.when).min()
+    }
+
     /// Return — and consume — every console line the VM has
     /// pushed since the previous drain. Includes:
     /// - `console.log` / `console.warn` / `console.error` lines

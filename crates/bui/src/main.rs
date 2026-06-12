@@ -1273,10 +1273,42 @@ fn find_favicon_href(doc: &bui_dom::Document) -> Option<String> {
 /// (start page, etc.) never carry a favicon.
 fn load_favicon(base: &Url, declared_href: Option<String>) -> Option<String> {
     let url = favicon_fetch_url(base, declared_href)?;
+    match shared_runtime().block_on(fetch_favicon_cached(&url))? {
+        (key, Some(image)) => {
+            bui_gpu::enqueue_upload(key.clone(), image);
+            Some(key)
+        }
+        // Cached hit — pixels were uploaded by an earlier page load.
+        (key, None) => Some(key),
+    }
+}
+
+/// Process-lifetime memo of favicon fetch outcomes by absolute URL.
+/// `true` = decoded + uploaded once already (the key is a valid GPU
+/// cache reference), `false` = known-bad (404 / undecodable .ico) —
+/// so a site without an icon doesn't pay a fetch on every page load.
+fn favicon_results() -> &'static Mutex<std::collections::HashMap<String, bool>> {
+    static RESULTS: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
+    RESULTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Fetch + decode a favicon unless its outcome is already known.
+/// `Some((key, Some(image)))` = fresh, caller uploads; `Some((key,
+/// None))` = cached success, key is already uploaded; `None` = known
+/// or just-discovered failure.
+async fn fetch_favicon_cached(url: &Url) -> Option<(String, Option<bui_image::Image>)> {
     let key = url.to_string();
-    let image = fetch_and_decode_image(&url)?;
-    bui_gpu::enqueue_upload(key.clone(), image);
-    Some(key)
+    match favicon_results().lock().unwrap().get(&key).copied() {
+        Some(true) => return Some((key, None)),
+        Some(false) => return None,
+        None => {}
+    }
+    let image = fetch_and_decode_image_async(url).await;
+    favicon_results()
+        .lock()
+        .unwrap()
+        .insert(key.clone(), image.is_some());
+    image.map(|i| (key, Some(i)))
 }
 
 /// Absolute favicon URL for a page: the declared `<link>` href when
@@ -1907,7 +1939,9 @@ enum LoadMsg {
         id: u64,
         sheets: Vec<bui_css::Stylesheet>,
         images: Vec<(String, Option<ImageResource>)>,
-        favicon: Option<(String, bui_image::Image)>,
+        /// `(key, Some(img))` = fresh icon to upload; `(key, None)` =
+        /// favicon-cache hit, pixels already on the GPU.
+        favicon: Option<(String, Option<bui_image::Image>)>,
     },
     /// Late paint-only pixels; not tied to a pending load.
     BgImages {
@@ -1976,12 +2010,8 @@ fn spawn_fetch_resources(
         } else {
             fetch_image_resources(img_urls)
         };
-        let favicon = favicon_url.and_then(|u| {
-            let key = u.to_string();
-            shared_runtime()
-                .block_on(fetch_and_decode_image_async(&u))
-                .map(|img| (key, img))
-        });
+        let favicon =
+            favicon_url.and_then(|u| shared_runtime().block_on(fetch_favicon_cached(&u)));
         let msg = LoadMsg::Resources {
             id,
             sheets,
@@ -2059,6 +2089,10 @@ struct BrowserState {
     /// build_scene each frame) advances the state machine.
     load_tx: std::sync::mpsc::Sender<LoadMsg>,
     load_rx: std::sync::mpsc::Receiver<LoadMsg>,
+    /// Deadline of the earliest scheduled JS-timer wakeup, shared
+    /// with the sleeper threads that fire it. Without this, page
+    /// timers only ran when user input happened to cause a repaint.
+    timer_wakeup: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// Dev-dock panel selector. The dock is always one of three live
@@ -2102,7 +2136,42 @@ impl BrowserState {
             next_load_id: 1,
             load_tx,
             load_rx,
+            timer_wakeup: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Arrange for the event loop to wake (and therefore tick JS
+    /// timers) no later than `deadline`. Clamped to ≥8 ms out so a
+    /// 1 ms setInterval can't spin the loop past ~125 fps. No-op when
+    /// an earlier wakeup is already pending.
+    fn schedule_timer_wakeup(&self, deadline: std::time::Instant) {
+        let deadline = deadline.max(std::time::Instant::now() + std::time::Duration::from_millis(8));
+        {
+            let mut slot = self.timer_wakeup.lock().unwrap();
+            if slot.is_some_and(|t| t <= deadline) {
+                return;
+            }
+            *slot = Some(deadline);
+        }
+        let Some(redrawer) = self.redrawer.clone() else {
+            return;
+        };
+        let wakeup = self.timer_wakeup.clone();
+        std::thread::spawn(move || {
+            let now = std::time::Instant::now();
+            if deadline > now {
+                std::thread::sleep(deadline - now);
+            }
+            // Clear any due slot — ours, or a stale one an earlier
+            // sleeper missed — so the next tick can re-schedule.
+            {
+                let mut slot = wakeup.lock().unwrap();
+                if slot.is_some_and(|t| t <= std::time::Instant::now()) {
+                    *slot = None;
+                }
+            }
+            redrawer.request_redraw();
+        });
     }
 
     fn active_tab(&self) -> &TabState {
@@ -2290,7 +2359,7 @@ impl BrowserState {
         id: u64,
         sheets: Vec<bui_css::Stylesheet>,
         images: Vec<(String, Option<ImageResource>)>,
-        favicon: Option<(String, bui_image::Image)>,
+        favicon: Option<(String, Option<bui_image::Image>)>,
     ) {
         let Some(pos) = self.loads.iter().position(|l| l.id == id) else {
             return; // cancelled
@@ -2306,7 +2375,9 @@ impl BrowserState {
         };
         let (img_reg, svg_reg) = build_image_registries(images, &img_by_url);
         let favicon_key = favicon.map(|(key, image)| {
-            bui_gpu::enqueue_upload(key.clone(), image);
+            if let Some(image) = image {
+                bui_gpu::enqueue_upload(key.clone(), image);
+            }
             key
         });
         let (next, bg_urls) = TabState::finalize(
@@ -2439,14 +2510,29 @@ fn run_browser(initial_url: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let initial = match TabState::fetch(&url) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("fetch error: {e}");
-            return ExitCode::FAILURE;
+    // Internal pages build instantly and synchronously; an external
+    // first page gets a placeholder tab so the window appears at once
+    // and the page streams in through the async loader (kicked off in
+    // on_proxy below, once the Redrawer exists).
+    let mut initial_load: Option<(u64, Url)> = None;
+    let initial = if url.is_internal() {
+        match TabState::fetch(&url) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("fetch error: {e}");
+                return ExitCode::FAILURE;
+            }
         }
+    } else {
+        let tab = placeholder_tab(&url);
+        initial_load = Some((tab.tab_id, url.clone()));
+        tab
     };
-    let app_title = format!("Copper — {}", initial.title);
+    let app_title = if url.is_internal() {
+        format!("Copper — {}", initial.title)
+    } else {
+        format!("Copper — {}", url.host)
+    };
     let state = Arc::new(Mutex::new(BrowserState::new(initial)));
 
     let render_state = state.clone();
@@ -2477,6 +2563,12 @@ fn run_browser(initial_url: &str) -> ExitCode {
         .on_proxy(move |redrawer| {
             let mut st = proxy_state.lock().unwrap();
             st.redrawer = Some(redrawer);
+            // External first page: start its async load now that the
+            // loop can be woken. The window paints the placeholder
+            // immediately instead of waiting on the network.
+            if let Some((tab_id, url)) = initial_load {
+                st.start_load(tab_id, url, NavOp::Replace);
+            }
             // Startup check, delayed so first paint + page load win the
             // network race.
             start_update_check(&st, std::time::Duration::from_secs(5));
@@ -2537,7 +2629,7 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
     // (common pattern: `setTimeout(() => location.href = url,
     // 500)`) actually navigate instead of stalling until the
     // next user input.
-    let pending_nav: Option<String> = {
+    let (pending_nav, next_timer): (Option<String>, Option<std::time::Instant>) = {
         let tab = st.active_tab_mut();
         if let Some(ctx) = tab.js_ctx.as_mut() {
             ctx.tick(std::time::Instant::now());
@@ -2548,11 +2640,17 @@ fn build_scene(viewport: Viewport, state: &Arc<Mutex<BrowserState>>) -> DisplayL
             if ctx.take_dirty() {
                 tab.last_width = 0;
             }
-            ctx.take_pending_navigation()
+            (ctx.take_pending_navigation(), ctx.next_timer_deadline())
         } else {
-            None
+            (None, None)
         }
     };
+    // Repaints are event-driven; without an explicit wakeup the next
+    // pending timer would only fire when the user happens to provide
+    // input. Schedule a wakeup at its deadline.
+    if let Some(deadline) = next_timer {
+        st.schedule_timer_wakeup(deadline);
+    }
     if let Some(target) = pending_nav {
         let cur_url = st.active_tab().url.clone();
         if let Ok(next_url) = cur_url.join(&target) {
