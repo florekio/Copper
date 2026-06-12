@@ -24,8 +24,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Intel macOS is cross-compiled from the arm64 runner — GitHub
+          # retired the last x86_64 macOS image (macos-13) in Dec 2025.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             ext: ""
           - target: aarch64-apple-darwin
             os: macos-latest
