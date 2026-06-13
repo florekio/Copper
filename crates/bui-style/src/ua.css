@@ -124,8 +124,17 @@ textarea { display: inline-block; padding: 2px 4px; border: 1px gray; background
    (`<input name="q">` or `<textarea name="q">`) ends up at x≈1517
    with width 0, off-screen. Until layout-side parity catches up,
    pin the search input + the surrounding form to a predictable
-   centred pill so the user can actually type a query. */
-input[name="q"], textarea[name="q"] {
+   centred pill so the user can actually type a query.
+
+   The `:not([data-ssg-id])` guard scopes this to Google: any
+   `<input name="q">` is a generic match, and DuckDuckGo's homepage
+   search field is also `name="q"` but carries `data-ssg-id`
+   (a DDG server-side-generated marker Google never emits). Without
+   the guard this `!important` pin overrode DDG's own `flex:1 1`
+   searchbox layout, yanking its input to top:280px and collapsing
+   the search bar. Google's input has no `data-ssg-id`, so its match
+   is unchanged. */
+input[name="q"]:not([data-ssg-id]), textarea[name="q"]:not([data-ssg-id]) {
     position: absolute !important;
     left: 50% !important;
     top: 280px !important;
