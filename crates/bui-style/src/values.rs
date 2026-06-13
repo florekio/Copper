@@ -676,6 +676,10 @@ pub struct ComputedValues {
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub flex_basis: FlexBasis,
+    /// `order` — flex/grid item ordinal. Items lay out sorted by this
+    /// value (ascending, stable); default 0. Negative values come
+    /// first. NOT inherited.
+    pub order: i32,
     // Positioning. `position: static` is the initial value; the four
     // edge offsets are `None` for `auto` and a `Length` otherwise.
     pub position: Position,
@@ -878,6 +882,7 @@ impl ComputedValues {
             flex_wrap: FlexWrap::Nowrap,
             flex_grow: 0.0,
             flex_shrink: 1.0,
+            order: 0,
             flex_basis: FlexBasis::Auto,
             position: Position::Static,
             top: None,
@@ -986,6 +991,7 @@ impl ComputedValues {
             flex_wrap: FlexWrap::Nowrap,
             flex_grow: 0.0,
             flex_shrink: 1.0,
+            order: 0,
             flex_basis: FlexBasis::Auto,
             position: Position::Static,
             top: None,
@@ -1548,6 +1554,11 @@ pub fn apply_declaration(
             _ => cv.flex_wrap = FlexWrap::Nowrap,
         },
         // ---- Flexbox item ----
+        "order" => {
+            if let Ok(n) = v.trim().parse::<i32>() {
+                cv.order = n;
+            }
+        }
         "flex-grow" => {
             if let Ok(n) = v.parse::<f32>() {
                 cv.flex_grow = n.max(0.0);

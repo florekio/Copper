@@ -1640,6 +1640,14 @@ fn layout_flex(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32, container_h
             }
         }
     }
+    // CSS Flexbox §5.4 — order-modified document order: items lay out
+    // sorted by their `order` (ascending, stable so equal orders keep
+    // document order). DuckDuckGo's CTA cards put `order:-1` on the
+    // last card to swap it ahead of the first. Sort BEFORE the
+    // reverse so row-reverse then mirrors the order-modified sequence.
+    if items.iter().any(|it| it.style.order != 0) {
+        items.sort_by_key(|it| it.style.order);
+    }
     if reversed {
         items.reverse();
     }
@@ -5821,6 +5829,85 @@ mod tests {
             "item A at {}", items[0].frame.x);
         assert!((items[1].frame.x - 700.0).abs() < 1.0,
             "item B at {}, expected 700", items[1].frame.x);
+    }
+
+    #[test]
+    fn flex_row_reverse_places_first_item_last() {
+        // flex-direction: row-reverse lays the FIRST DOM item at the
+        // RIGHT. DuckDuckGo's CTA cards are row-reverse: DOM order
+        // [browser, search] must render [search, browser] L→R.
+        let (doc, style) = doc_from_html(
+            "<style>\
+                 body { margin: 0 }\
+                 .row { display: flex; flex-direction: row-reverse }\
+                 .item { width: 100px; height: 30px }\
+             </style>\
+             <body><div class=\"row\">\
+                 <div id=\"a\" class=\"item\">A</div>\
+                 <div id=\"b\" class=\"item\">B</div>\
+             </div></body>",
+        );
+        let body = doc
+            .descendants(doc.root)
+            .find(|n| doc.element(*n).map(|e| e.name == "body").unwrap_or(false))
+            .unwrap();
+        let mut bx = build(&doc, &style, body);
+        layout(&mut bx, 0.0, 0.0, 800.0);
+        let row = bx.children.iter()
+            .find(|c| matches!(c.style.display, Display::Flex)).expect("flex row");
+        // Find A and B by id and assert A is to the RIGHT of B.
+        let mut ax = -1.0; let mut bxx = -1.0;
+        for c in &row.children {
+            if let Some(n) = c.node {
+                if let Some(e) = doc.element(n) {
+                    match e.get_attr("id") {
+                        Some("a") => ax = c.frame.x,
+                        Some("b") => bxx = c.frame.x,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(ax > bxx, "row-reverse: A (x={ax}) must be right of B (x={bxx})");
+    }
+
+    #[test]
+    fn flex_order_reorders_items() {
+        // CSS `order` lays items in order-modified document order:
+        // `order:-1` on the second item moves it before the first.
+        // DuckDuckGo's CTA cards rely on this.
+        let (doc, style) = doc_from_html(
+            "<style>\
+                 body { margin: 0 }\
+                 .row { display: flex }\
+                 .item { width: 100px; height: 30px }\
+                 .first { order: -1 }\
+             </style>\
+             <body><div class=\"row\">\
+                 <div id=\"a\" class=\"item\">A</div>\
+                 <div id=\"b\" class=\"item first\">B</div>\
+             </div></body>",
+        );
+        let body = doc
+            .descendants(doc.root)
+            .find(|n| doc.element(*n).map(|e| e.name == "body").unwrap_or(false))
+            .unwrap();
+        let mut bx = build(&doc, &style, body);
+        layout(&mut bx, 0.0, 0.0, 800.0);
+        let row = bx.children.iter()
+            .find(|c| matches!(c.style.display, Display::Flex)).expect("flex row");
+        let mut ax = -1.0; let mut bxx = -1.0;
+        for c in &row.children {
+            if let Some(n) = c.node {
+                match doc.element(n).and_then(|e| e.get_attr("id")) {
+                    Some("a") => ax = c.frame.x,
+                    Some("b") => bxx = c.frame.x,
+                    _ => {}
+                }
+            }
+        }
+        // B (order:-1) lays out first → left of A.
+        assert!(bxx < ax, "order:-1 B (x={bxx}) must be left of A (x={ax})");
     }
 
     #[test]
