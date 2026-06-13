@@ -247,6 +247,23 @@ fn build_block(
     // Without this, Wikipedia's `.mw-logo-wordmark { display: block }`
     // collapsed to an empty 140×22 rectangle with no logo visible.
     let img_replaced: Option<BoxKind> = doc.element(node).and_then(|e| {
+        // A direct `<svg>` is a replaced element too. When it lands here
+        // (display:block, or — far more common — a child of a flex/grid
+        // container, which `is_block` forces through build_block) the
+        // inline `elem.name == "svg"` branch never runs, so its paths get
+        // no box and the svg collapses to height 0. DuckDuckGo's search
+        // mode toggle icons (`<svg viewBox="0 0 16 16">` inside an
+        // `inline-flex` button) hit exactly this and rendered as 16×0.
+        // Parse it into an InlineSvg leaf like the inline path does.
+        if e.name == "svg" {
+            let host_color = bui_paint::Color::rgba(
+                cv.color.r,
+                cv.color.g,
+                cv.color.b,
+                cv.color.a,
+            );
+            return svg::parse_svg_with_color(doc, node, host_color).map(BoxKind::InlineSvg);
+        }
         if e.name != "img" {
             return None;
         }
