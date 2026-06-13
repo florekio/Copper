@@ -624,28 +624,37 @@ pub fn parse_path_d(d: &str) -> Vec<PathSegment> {
                 last_quad_c = None;
             }
             b'A' | b'a' => {
-                // Skip 7 numbers per arc; produce a straight line as a
-                // visual fallback so dropped arcs don't desync the pen.
-                while let Some(_rx) = p.next_num() {
-                    let _ry = p.next_num();
-                    let _rot = p.next_num();
-                    let _laf = p.next_num();
-                    let _sf = p.next_num();
+                // Elliptical arc: rx ry x-rot large-arc-flag sweep-flag x y.
+                // The two flags are single 0/1 digits (possibly unseparated),
+                // so they MUST use next_flag, not next_num. Each arc is
+                // converted to cubic beziers — circles/rounded shapes in
+                // logos & icons (DuckDuckGo's duck disc) draw with arcs.
+                while let Some(rx) = p.next_num() {
+                    let ry = p.next_num();
+                    let rot = p.next_num();
+                    let laf = p.next_flag();
+                    let sf = p.next_flag();
                     let x = p.next_num();
                     let y = p.next_num();
-                    if let (Some(x), Some(y)) = (x, y) {
-                        let (ax, ay) = if cmd == b'a' {
+                    if let (Some(ry), Some(rot), Some(laf), Some(sf), Some(x), Some(y)) =
+                        (ry, rot, laf, sf, x, y)
+                    {
+                        let end = if cmd == b'a' {
                             (pen.0 + x, pen.1 + y)
                         } else {
                             (x, y)
                         };
-                        out.push(PathSegment::LineTo(ax, ay));
-                        pen = (ax, ay);
+                        push_arc(&mut out, pen, rx, ry, rot, laf, sf, end);
+                        pen = end;
+                    } else {
+                        break;
                     }
                     if !p.peek_arg() {
                         break;
                     }
                 }
+                last_cubic_c2 = None;
+                last_quad_c = None;
             }
             _ => {} // unknown, skip
         }
@@ -755,6 +764,119 @@ impl<'a> PathParser<'a> {
         let x = self.next_num()?;
         let y = self.next_num()?;
         Some((x, y))
+    }
+
+    /// Read an arc flag: a single `0` or `1`. In the arc command the
+    /// large-arc and sweep flags are single digits that may run together
+    /// with no separator (`...0 11,0...`), so they can't go through
+    /// `next_num` (which would swallow `11` as one number).
+    fn next_flag(&mut self) -> Option<bool> {
+        self.skip_ws();
+        match self.bytes.get(self.pos) {
+            Some(&b'0') => { self.pos += 1; Some(false) }
+            Some(&b'1') => { self.pos += 1; Some(true) }
+            _ => None,
+        }
+    }
+}
+
+/// Convert one SVG elliptical arc (endpoint parameterization) into cubic
+/// bezier `CurveTo` segments appended to `out`. Implements the W3C SVG
+/// arc→center conversion (Implementation Notes F.6), splitting the sweep
+/// into ≤90° pieces each approximated by a cubic. `start`/`end` are
+/// absolute. A degenerate arc (zero radius) falls back to a line.
+fn push_arc(
+    out: &mut Vec<PathSegment>,
+    start: (f32, f32),
+    rx: f32,
+    ry: f32,
+    x_axis_rotation_deg: f32,
+    large_arc: bool,
+    sweep: bool,
+    end: (f32, f32),
+) {
+    let (x1, y1) = start;
+    let (x2, y2) = end;
+    let mut rx = rx.abs();
+    let mut ry = ry.abs();
+    if rx < 1e-6 || ry < 1e-6 || (x1 - x2).abs() < 1e-9 && (y1 - y2).abs() < 1e-9 {
+        out.push(PathSegment::LineTo(x2, y2));
+        return;
+    }
+    let phi = x_axis_rotation_deg.to_radians();
+    let (cos_p, sin_p) = (phi.cos(), phi.sin());
+    // Step 1: midpoint in the rotated frame.
+    let dx = (x1 - x2) / 2.0;
+    let dy = (y1 - y2) / 2.0;
+    let x1p = cos_p * dx + sin_p * dy;
+    let y1p = -sin_p * dx + cos_p * dy;
+    // Step 2: correct out-of-range radii.
+    let lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+    if lambda > 1.0 {
+        let s = lambda.sqrt();
+        rx *= s;
+        ry *= s;
+    }
+    // Step 3: center in the rotated frame.
+    let num = (rx * rx) * (ry * ry) - (rx * rx) * (y1p * y1p) - (ry * ry) * (x1p * x1p);
+    let den = (rx * rx) * (y1p * y1p) + (ry * ry) * (x1p * x1p);
+    let mut coef = if den > 0.0 { (num / den).max(0.0).sqrt() } else { 0.0 };
+    if large_arc == sweep {
+        coef = -coef;
+    }
+    let cxp = coef * (rx * y1p) / ry;
+    let cyp = coef * -(ry * x1p) / rx;
+    // Step 4: center in the original frame.
+    let cx = cos_p * cxp - sin_p * cyp + (x1 + x2) / 2.0;
+    let cy = sin_p * cxp + cos_p * cyp + (y1 + y2) / 2.0;
+    // Step 5: start angle + sweep angle.
+    let ang = |ux: f32, uy: f32, vx: f32, vy: f32| -> f32 {
+        let dot = ux * vx + uy * vy;
+        let len = ((ux * ux + uy * uy) * (vx * vx + vy * vy)).sqrt();
+        let mut a = (dot / len).clamp(-1.0, 1.0).acos();
+        if ux * vy - uy * vx < 0.0 {
+            a = -a;
+        }
+        a
+    };
+    let ux = (x1p - cxp) / rx;
+    let uy = (y1p - cyp) / ry;
+    let vx = (-x1p - cxp) / rx;
+    let vy = (-y1p - cyp) / ry;
+    let theta1 = ang(1.0, 0.0, ux, uy);
+    let mut dtheta = ang(ux, uy, vx, vy);
+    if !sweep && dtheta > 0.0 {
+        dtheta -= std::f32::consts::TAU;
+    } else if sweep && dtheta < 0.0 {
+        dtheta += std::f32::consts::TAU;
+    }
+    // Split into ≤90° segments; cubic-approximate each.
+    let n = (dtheta.abs() / (std::f32::consts::FRAC_PI_2)).ceil().max(1.0) as usize;
+    let seg = dtheta / n as f32;
+    let t = (4.0 / 3.0) * (seg / 4.0).tan();
+    let mut a0 = theta1;
+    for _ in 0..n {
+        let a1 = a0 + seg;
+        let (cos0, sin0) = (a0.cos(), a0.sin());
+        let (cos1, sin1) = (a1.cos(), a1.sin());
+        // Points + tangent control points on the unit ellipse, then
+        // scale by rx/ry and rotate by phi into the original frame.
+        let p = |c: f32, s: f32| (cx + cos_p * (rx * c) - sin_p * (ry * s),
+                                  cy + sin_p * (rx * c) + cos_p * (ry * s));
+        let (e1x, e1y) = p(cos1, sin1);
+        // Control points use the arc tangents.
+        let c1lx = cos0 - t * sin0;
+        let c1ly = sin0 + t * cos0;
+        let c2lx = cos1 + t * sin1;
+        let c2ly = sin1 - t * cos1;
+        let (c1x, c1y) = p(c1lx, c1ly);
+        let (c2x, c2y) = p(c2lx, c2ly);
+        out.push(PathSegment::CurveTo {
+            c1: (c1x, c1y),
+            c2: (c2x, c2y),
+            end: (e1x, e1y),
+        });
+        a0 = a1;
     }
 }
 
@@ -955,6 +1077,37 @@ mod tests {
             }
             _ => panic!("expected CurveTo"),
         }
+    }
+
+    #[test]
+    fn arc_converts_to_beziers_spanning_endpoints() {
+        // A half-circle arc from (0,0) to (20,0), r=10, should produce
+        // CurveTo segments (not be skipped) and reach the endpoint.
+        let segs = parse_path_d("M 0 0 A 10 10 0 0 1 20 0");
+        assert!(segs.len() >= 2, "arc should emit at least one curve, got {segs:?}");
+        assert!(
+            segs.iter().any(|s| matches!(s, PathSegment::CurveTo { .. })),
+            "arc must become CurveTo segments"
+        );
+        // Last segment ends at (20, 0).
+        match segs.last().unwrap() {
+            PathSegment::CurveTo { end, .. } => {
+                assert!((end.0 - 20.0).abs() < 0.5 && end.1.abs() < 0.5, "ends at {end:?}");
+            }
+            other => panic!("expected CurveTo at end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arc_flags_may_be_unseparated() {
+        // The large-arc / sweep flags can run together with the next
+        // number: `...0 11,0...`. Must parse as flags 1,1 then x=1,y=0
+        // — NOT swallow `11` as one number.
+        let segs = parse_path_d("M 5 5 a 5 5 0 11 1 0");
+        assert!(
+            segs.iter().any(|s| matches!(s, PathSegment::CurveTo { .. })),
+            "unseparated arc flags should still parse to curves, got {segs:?}"
+        );
     }
 
     #[test]
