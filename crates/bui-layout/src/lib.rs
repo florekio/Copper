@@ -685,6 +685,32 @@ fn collect_children(
                     cv.position,
                     bui_style::Position::Absolute | bui_style::Position::Fixed,
                 );
+                // `<input>` is a replaced element, like <textarea> above.
+                // Author CSS can set `display: flex` on it (DuckDuckGo's
+                // homepage does: `.searchInput { display: flex }`) but a
+                // real browser never lays an <input> out as a flex/grid
+                // container — it paints a UA widget in the box. Without
+                // this short-circuit, build_block turned the input into an
+                // empty flex container and its value/placeholder text was
+                // dropped (DDG's search bar rendered as a blank pill).
+                // Route visible, in-flow inputs through the inline-control
+                // path. Out-of-flow inputs (e.g. Wikipedia's `position:
+                // absolute; opacity: 0` dropdown checkbox) still fall
+                // through to the block path so they're removed from flow.
+                let is_visible_input = doc
+                    .element(c)
+                    .map(|e| {
+                        e.name == "input"
+                            && !matches!(
+                                e.get_attr("type").map(|s| s.to_ascii_lowercase()).as_deref(),
+                                Some("hidden") | Some("file") | Some("image")
+                            )
+                    })
+                    .unwrap_or(false);
+                if is_visible_input && !is_out_of_flow {
+                    pending_inline.push(PendingInline::Dom(c));
+                    continue;
+                }
                 let is_block = parent_is_flex_or_grid || is_out_of_flow || matches!(
                     cv.display,
                     Display::Block
