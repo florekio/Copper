@@ -1449,6 +1449,19 @@ fn estimate_walk(bx: &LayoutBox, font: &bui_text::Font, best: &mut f32) {
     // counted as one unwrapped line.
     let mut run_w = 0.0_f32;
     for child in &bx.children {
+        // Out-of-flow children (position:absolute/fixed) are removed from
+        // flow and don't contribute to an ancestor's intrinsic (max-content)
+        // width. Without this skip, DuckDuckGo's visually-hidden
+        // `<span class="sr-only" style="position:absolute">Main navigation
+        // menu…</span>` — clipped to a 1px box — still had its full text
+        // width (~240px) counted, inflating the header-menu nav's flex
+        // basis and pushing it past the viewport edge.
+        if matches!(
+            child.style.position,
+            bui_style::Position::Absolute | bui_style::Position::Fixed
+        ) {
+            continue;
+        }
         match &child.kind {
             BoxKind::InlineText(s) => {
                 let w = font.measure_text_with_spacing(s, child.style.font_size, child.style.letter_spacing);
