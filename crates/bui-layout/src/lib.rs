@@ -2140,6 +2140,75 @@ fn layout_flex(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32, container_h
     }
 }
 
+/// Resolve the rendered size of a replaced inline element (`<img>` /
+/// inline SVG) from its CSS width/height, intrinsic size, and the
+/// containing block. CSS rules honored:
+///   * px lengths resolve directly; percent WIDTH against `container_w`,
+///     percent HEIGHT against `container_h` (the containing block's
+///     content height) — NOT the width. When height is a percent and no
+///     definite container height exists, it computes back to `auto`.
+///   * `auto` on one axis preserves the intrinsic aspect ratio from the
+///     other; `auto` on both uses the intrinsic size.
+///   * `max-width` / `max-height` clamp the result (percent against the
+///     matching container axis), preserving aspect ratio.
+/// This is what keeps DuckDuckGo's header wordmark (`width:auto;
+/// height:100%` against a 32px-tall `<a>`) from exploding to viewport
+/// height when percent-height fell through to the width basis.
+fn resolve_replaced_size(
+    cv: &ComputedValues,
+    intrinsic_w: f32,
+    intrinsic_h: f32,
+    container_w: f32,
+    container_h: Option<f32>,
+) -> (f32, f32) {
+    let aspect = if intrinsic_h > 0.0 { intrinsic_w / intrinsic_h } else { 1.0 };
+    // A percent height is only definite when the container height is.
+    let height_definite = |l: &Length| -> Option<f32> {
+        match l {
+            Length::Percent(p) => container_h.map(|ch| ch * p / 100.0),
+            other => Some(other.resolve(cv.font_size, 16.0, container_w)),
+        }
+    };
+    let w_spec = match cv.width {
+        Dimension::Length(l) => Some(l.resolve(cv.font_size, 16.0, container_w).max(0.0)),
+        Dimension::Auto => None,
+    };
+    let h_spec = match cv.height {
+        Dimension::Length(l) => height_definite(&l).map(|v| v.max(0.0)),
+        Dimension::Auto => None,
+    };
+    let (mut w, mut h) = match (w_spec, h_spec) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, if aspect > 0.0 { w / aspect } else { intrinsic_h }),
+        (None, Some(h)) => (h * aspect, h),
+        (None, None) => (intrinsic_w, intrinsic_h),
+    };
+    // max-width / max-height clamp, preserving aspect ratio.
+    if let Some(mw) = cv.max_width {
+        let lim = match mw {
+            Length::Percent(p) => container_w * p / 100.0,
+            other => other.resolve(cv.font_size, 16.0, container_w),
+        };
+        if lim > 0.0 && w > lim {
+            h *= lim / w;
+            w = lim;
+        }
+    }
+    if let Some(mh) = cv.max_height {
+        let lim = match mh {
+            Length::Percent(p) => container_h.map(|ch| ch * p / 100.0),
+            other => Some(other.resolve(cv.font_size, 16.0, container_w)),
+        };
+        if let Some(lim) = lim {
+            if lim > 0.0 && h > lim {
+                w *= lim / h;
+                h = lim;
+            }
+        }
+    }
+    (w.max(1.0), h.max(1.0))
+}
+
 fn content_height_hint(cv: &ComputedValues, basis: f32, container_h: Option<f32>) -> f32 {
     // For ANY length on height — including calc(100% - Npx) — the
     // percent basis is the parent's resolved (and max-height-clamped)
@@ -3571,7 +3640,7 @@ fn layout_block(
                     match child.kind {
                         BoxKind::Block => layout_block(&mut child, place_x, place_y, target_w, child_container_h),
                         BoxKind::Anonymous => {
-                            layout_inline(&mut child, place_x, place_y, target_w)
+                            layout_inline(&mut child, place_x, place_y, target_w, child_container_h)
                         }
                         _ => layout_block(&mut child, place_x, place_y, target_w, child_container_h),
                     }
@@ -3594,7 +3663,7 @@ fn layout_block(
                     match child.kind {
                         BoxKind::Block => layout_block(&mut child, place_x, place_y, target_w, child_container_h),
                         BoxKind::Anonymous => {
-                            layout_inline(&mut child, place_x, place_y, target_w)
+                            layout_inline(&mut child, place_x, place_y, target_w, child_container_h)
                         }
                         _ => layout_block(&mut child, place_x, place_y, target_w, child_container_h),
                     }
@@ -3636,7 +3705,7 @@ fn layout_block(
                 bx.children.push(child);
             }
             BoxKind::Anonymous => {
-                layout_inline(&mut child, avail_x, cursor_y, avail_w);
+                layout_inline(&mut child, avail_x, cursor_y, avail_w, child_container_h);
                 if !out_of_flow {
                     cursor_y = child.frame.y + child.frame.height;
                     last_margin_bottom = 0.0;
@@ -3658,7 +3727,7 @@ fn layout_block(
                     frame: Frame::ZERO,
                     lines: Vec::new(), list_marker: None, colspan: 1, rowspan: 1, col_widths: Vec::new(),
                 };
-                layout_inline(&mut anon, avail_x, cursor_y, avail_w);
+                layout_inline(&mut anon, avail_x, cursor_y, avail_w, child_container_h);
                 cursor_y = anon.frame.y + anon.frame.height;
                 last_margin_bottom = 0.0;
                 bx.children.push(anon);
@@ -3756,7 +3825,7 @@ fn layout_block(
     };
 }
 
-fn layout_inline(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32) {
+fn layout_inline(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32, container_h: Option<f32>) {
     let mut lines: Vec<LineBox> = Vec::new();
     let mut cur_items: Vec<LineItem> = Vec::new();
     // CSS `text-indent` applies to the first line of inline content.
@@ -3906,14 +3975,9 @@ fn layout_inline(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32) {
                 let intrinsic_w = entry.width.max(1.0);
                 let intrinsic_h = entry.height.max(1.0);
                 let cv = &child.style;
-                let img_w = match cv.width {
-                    Dimension::Length(l) => l.resolve(cv.font_size, 16.0, container_w).max(0.0),
-                    Dimension::Auto => intrinsic_w,
-                };
-                let img_h = match cv.height {
-                    Dimension::Length(l) => l.resolve(cv.font_size, 16.0, container_w).max(0.0),
-                    Dimension::Auto => intrinsic_h,
-                };
+                let (img_w, img_h) = resolve_replaced_size(
+                    cv, intrinsic_w, intrinsic_h, container_w, container_h,
+                );
                 max_font_size = max_font_size.max(img_h);
                 if cur_x + img_w > container_w && !cur_items.is_empty() {
                     let line_h = max_font_size * cv.line_height.max(1.0);
@@ -3958,44 +4022,29 @@ fn layout_inline(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32) {
                 // Google's `svg { height: 100%; width: 100% }` icons
                 // would otherwise render at 36 wide but 960 tall and
                 // stretch their parent's line to 1152 px.
-                let aspect = intrinsic_w / intrinsic_h;
-                let (svg_w, svg_h) = match (cv.width, cv.height) {
-                    (Dimension::Length(lw), Dimension::Length(lh)) => (
-                        lw.resolve(cv.font_size, 16.0, container_w).max(0.0),
-                        lh.resolve(cv.font_size, 16.0, container_w).max(0.0),
-                    ),
-                    (Dimension::Length(lw), Dimension::Auto) => {
-                        let w = lw.resolve(cv.font_size, 16.0, container_w).max(0.0);
-                        (w, w / aspect)
-                    }
-                    (Dimension::Auto, Dimension::Length(lh)) => {
-                        let h = lh.resolve(cv.font_size, 16.0, container_w).max(0.0);
-                        (h * aspect, h)
-                    }
-                    (Dimension::Auto, Dimension::Auto) => {
-                        // Without an HTML width/height attribute on
-                        // the <svg> itself, parse_svg fell back to
-                        // the viewBox dimensions — fine for proper
-                        // logo SVGs (they declare attrs) but wrong
-                        // for icon SVGs that ship as <svg viewBox="0
-                        // -960 960 960"> and rely on a parent class
-                        // to size them. When the SVG has no explicit
-                        // attrs (signalled by intrinsic == viewBox
-                        // and intrinsic looks "icon-shaped" — square
-                        // and big), fall back to a font_size-scaled
-                        // square so it renders as an icon instead of
-                        // blowing out the inline line height.
-                        let no_attr_size = entry.no_attr_size;
-                        let looks_iconlike =
-                            no_attr_size && (intrinsic_w - intrinsic_h).abs() < 0.5
-                                && intrinsic_w >= 64.0;
-                        if looks_iconlike {
-                            let s = cv.font_size.max(16.0);
-                            (s, s)
-                        } else {
-                            (intrinsic_w, intrinsic_h)
-                        }
-                    }
+                // Icon SVGs that ship as `<svg viewBox="0 -960 960 960">`
+                // with no width/height attrs and rely on a parent class to
+                // size them: when BOTH axes are auto, fall back to a
+                // font-size-scaled square so they render as glyph-sized
+                // icons instead of blowing out the line to the viewBox's
+                // hundreds of px (Google's material icons). Everything else
+                // — including a definite axis with the other auto, and the
+                // wordmark's `width:auto; height:100%` — goes through the
+                // shared replaced-size resolver (percent height resolves
+                // against the container height, aspect ratio preserved).
+                let no_attr_size = entry.no_attr_size;
+                let both_auto = matches!(
+                    (cv.width, cv.height),
+                    (Dimension::Auto, Dimension::Auto)
+                );
+                let looks_iconlike = no_attr_size
+                    && (intrinsic_w - intrinsic_h).abs() < 0.5
+                    && intrinsic_w >= 64.0;
+                let (svg_w, svg_h) = if both_auto && looks_iconlike {
+                    let s = cv.font_size.max(16.0);
+                    (s, s)
+                } else {
+                    resolve_replaced_size(cv, intrinsic_w, intrinsic_h, container_w, container_h)
                 };
                 let svg_w = svg_w.max(1.0);
                 let svg_h = svg_h.max(1.0);
@@ -5869,6 +5918,32 @@ mod tests {
             }
         }
         assert!(ax > bxx, "row-reverse: A (x={ax}) must be right of B (x={bxx})");
+    }
+
+    #[test]
+    fn replaced_percent_height_resolves_against_container_height() {
+        // `width:auto; height:100%` on a replaced element (the
+        // DuckDuckGo header wordmark, viewBox 189x53) must resolve
+        // height against the container's HEIGHT (32px), preserving the
+        // viewBox aspect — NOT against the width (which exploded it).
+        let mut cv = ComputedValues::root_default();
+        cv.width = Dimension::Auto;
+        cv.height = Dimension::Length(Length::Percent(100.0));
+        let (w, h) = resolve_replaced_size(&cv, 189.0, 53.0, 1152.0, Some(32.0));
+        assert!((h - 32.0).abs() < 0.5, "height should be 32 (100% of container), got {h}");
+        let expected_w = 32.0 * (189.0 / 53.0);
+        assert!((w - expected_w).abs() < 1.0, "width should preserve aspect (~{expected_w}), got {w}");
+    }
+
+    #[test]
+    fn replaced_percent_height_indefinite_falls_back_to_intrinsic() {
+        // With no definite container height, percent height is auto →
+        // intrinsic size (not the viewport / width).
+        let mut cv = ComputedValues::root_default();
+        cv.width = Dimension::Auto;
+        cv.height = Dimension::Length(Length::Percent(100.0));
+        let (w, h) = resolve_replaced_size(&cv, 189.0, 53.0, 1152.0, None);
+        assert!((w - 189.0).abs() < 0.5 && (h - 53.0).abs() < 0.5, "got {w}x{h}");
     }
 
     #[test]

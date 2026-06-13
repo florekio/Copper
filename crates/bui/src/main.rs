@@ -1233,9 +1233,31 @@ fn best_image_url(
                     }
                     if let Some(e) = doc.element(c) {
                         if e.name == "source" {
-                            if let Some(srcset) = e.get_attr("srcset") {
-                                if let Some(u) = first_srcset_url(srcset) {
-                                    return Some(u);
+                            // Skip a `<source>` gated on a media query that
+                            // doesn't match our (light, no-preference)
+                            // rendering — most importantly
+                            // `(prefers-color-scheme: dark)`, whose asset is
+                            // a white-on-transparent variant that would be
+                            // invisible on our light canvas (DuckDuckGo's
+                            // header wordmark ships both). A source with no
+                            // media, or one naming light/no-preference,
+                            // matches.
+                            let media_ok = match e.get_attr("media") {
+                                None => true,
+                                Some(m) => {
+                                    let m = m.to_ascii_lowercase();
+                                    if m.contains("prefers-color-scheme: dark") {
+                                        m.contains("light") || m.contains("no-preference")
+                                    } else {
+                                        true
+                                    }
+                                }
+                            };
+                            if media_ok {
+                                if let Some(srcset) = e.get_attr("srcset") {
+                                    if let Some(u) = first_srcset_url(srcset) {
+                                        return Some(u);
+                                    }
                                 }
                             }
                         }
@@ -1257,7 +1279,22 @@ fn best_image_url(
 /// `"url-1 1x, url-2 2x"` → `Some("url-1")`. Returns None for empty
 /// / malformed input.
 fn first_srcset_url(srcset: &str) -> Option<String> {
-    let first = srcset.split(',').next()?.trim();
+    let trimmed = srcset.trim();
+    // A data: URI candidate contains commas (`data:...;base64,XXXX`), so
+    // the naive comma split truncates it. The base64/percent payload
+    // never contains a space, so a comma FOLLOWED BY whitespace reliably
+    // marks the next srcset candidate. Take the first candidate and drop
+    // any trailing ` 1x`/` 2x`/` Nw` descriptor. DuckDuckGo's header
+    // wordmark is a data: URI inside `<picture><source srcset>`.
+    if trimmed.get(..5).map(|s| s.eq_ignore_ascii_case("data:")).unwrap_or(false) {
+        let candidate = match trimmed.find(", ") {
+            Some(p) => &trimmed[..p],
+            None => trimmed,
+        };
+        let url = candidate.split_ascii_whitespace().next().unwrap_or(candidate);
+        return if url.is_empty() { None } else { Some(url.to_string()) };
+    }
+    let first = trimmed.split(',').next()?.trim();
     let url = first.split_ascii_whitespace().next()?;
     if url.is_empty() {
         None
