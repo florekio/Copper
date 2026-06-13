@@ -1004,11 +1004,12 @@ fn preload_images(
     base: &Url,
     doc: &bui_dom::Document,
 ) -> (bui_layout::ImageRegistry, bui_layout::SvgRegistry) {
-    let (by_url, unique_urls) = collect_image_urls(base, doc);
+    let (by_url, unique_urls, data_resources) = collect_image_urls(base, doc);
     if by_url.is_empty() {
         return (bui_layout::ImageRegistry::new(), bui_layout::SvgRegistry::new());
     }
-    let results = fetch_image_resources(unique_urls);
+    let mut results = fetch_image_resources(unique_urls);
+    results.extend(data_resources);
     build_image_registries(results, &by_url)
 }
 
@@ -1019,14 +1020,22 @@ fn preload_images(
 fn collect_image_urls(
     base: &Url,
     doc: &bui_dom::Document,
-) -> (std::collections::HashMap<String, Vec<bui_dom::NodeId>>, Vec<Url>) {
+) -> (
+    std::collections::HashMap<String, Vec<bui_dom::NodeId>>,
+    Vec<Url>,
+    Vec<(String, Option<ImageResource>)>,
+) {
     let mut by_url: std::collections::HashMap<String, Vec<bui_dom::NodeId>> =
         std::collections::HashMap::new();
     let mut url_for_key: std::collections::HashMap<String, Url> =
         std::collections::HashMap::new();
+    // data: URIs are decoded inline here (not network-fetched), keyed
+    // by the full src string so build_image_registries can assign them.
+    let mut data_uris: std::collections::HashMap<String, Option<ImageResource>> =
+        std::collections::HashMap::new();
     if base.is_internal() {
         // copper:// pages don't load remote resources.
-        return (by_url, Vec::new());
+        return (by_url, Vec::new(), Vec::new());
     }
     for node in doc.descendants(doc.root) {
         let Some(elem) = doc.element(node) else { continue };
@@ -1034,6 +1043,14 @@ fn collect_image_urls(
             continue;
         }
         let Some(src) = best_image_url(doc, node, elem) else { continue };
+        if src.trim_start().get(..5).map(|s| s.eq_ignore_ascii_case("data:")).unwrap_or(false) {
+            // The registry key for an <img> is its absolute URL string;
+            // for a data: URI that's the src verbatim (matches what the
+            // layout/paint path keys on).
+            by_url.entry(src.clone()).or_default().push(node);
+            data_uris.entry(src.clone()).or_insert_with(|| decode_data_uri_image(&src));
+            continue;
+        }
         let img_url = match base.join(&src) {
             Ok(u) => u,
             Err(_) => continue,
@@ -1043,7 +1060,8 @@ fn collect_image_urls(
         url_for_key.entry(key).or_insert(img_url);
     }
     let unique_urls: Vec<Url> = url_for_key.into_values().collect();
-    (by_url, unique_urls)
+    let data_resources: Vec<(String, Option<ImageResource>)> = data_uris.into_iter().collect();
+    (by_url, unique_urls, data_resources)
 }
 
 /// Pass 2: fetch + decode unique image URLs. Blocking
@@ -1111,6 +1129,83 @@ fn build_image_registries(
 enum ImageResource {
     Raster(bui_image::Image),
     Vector(bui_layout::SvgEntry),
+}
+
+/// Decode a `data:` URI into an image resource. Handles
+/// `data:[<mime>][;base64],<payload>` — base64 or percent-encoded.
+/// SVG payloads go through the SVG parser, everything else through the
+/// raster decoder. Common for inline icons (DuckDuckGo's gold
+/// magnifying-glass CTA icon is a base64 `image/svg+xml` data URI).
+fn decode_data_uri_image(src: &str) -> Option<ImageResource> {
+    let rest = src.strip_prefix("data:").or_else(|| src.strip_prefix("DATA:"))?;
+    let (meta, payload) = rest.split_once(',')?;
+    let meta_lower = meta.to_ascii_lowercase();
+    let bytes: Vec<u8> = if meta_lower.contains("base64") {
+        decode_base64(payload.trim())?
+    } else {
+        percent_decode_bytes(payload)
+    };
+    let is_svg = meta_lower.contains("svg")
+        || matches!(bui_image::detect_format(&bytes), bui_image::Format::Svg);
+    if is_svg {
+        parse_svg_bytes(&bytes).map(ImageResource::Vector)
+    } else {
+        bui_image::decode(&bytes).ok().map(ImageResource::Raster)
+    }
+}
+
+/// Minimal standard-base64 decoder (RFC 4648, `+/` alphabet). Ignores
+/// ASCII whitespace; returns None on a malformed alphabet character.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut nbits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c)? as u32;
+        acc = (acc << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Percent-decode a data-URI payload (`%XX` → byte), passing other
+/// bytes through. Used for the non-base64 `data:image/svg+xml,<text>`
+/// form.
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Choose the URL for an `<img>`, considering siblings + own
@@ -1830,7 +1925,7 @@ impl TabState {
                 }
             }
         }
-        let (sources, (img_by_url, img_urls), favicon_href) = {
+        let (sources, (img_by_url, img_urls, img_data), favicon_href) = {
             let d = booted.doc.lock().unwrap();
             (
                 collect_sheet_sources(url, &d),
@@ -1839,7 +1934,9 @@ impl TabState {
             )
         };
         let sheets = resolve_sheet_sources(url, sources);
-        let (images, svgs) = build_image_registries(fetch_image_resources(img_urls), &img_by_url);
+        let mut img_results = fetch_image_resources(img_urls);
+        img_results.extend(img_data);
+        let (images, svgs) = build_image_registries(img_results, &img_by_url);
         let favicon_key = load_favicon(url, favicon_href);
         let (mut tab, bg_urls) = TabState::finalize(
             url,
@@ -2202,15 +2299,18 @@ fn spawn_fetch_resources(
     base: Url,
     sources: Vec<SheetSource>,
     img_urls: Vec<Url>,
+    img_data: Vec<(String, Option<ImageResource>)>,
     favicon_url: Option<Url>,
 ) {
     std::thread::spawn(move || {
         let sheets = resolve_sheet_sources(&base, sources);
-        let images = if img_urls.is_empty() {
+        let mut images = if img_urls.is_empty() {
             Vec::new()
         } else {
             fetch_image_resources(img_urls)
         };
+        // Inline data: URIs were decoded synchronously during collection.
+        images.extend(img_data);
         let favicon =
             favicon_url.and_then(|u| shared_runtime().block_on(fetch_favicon_cached(&u)));
         let msg = LoadMsg::Resources {
@@ -2554,7 +2654,7 @@ impl BrowserState {
                 return;
             }
         }
-        let (sources, (img_by_url, img_urls), favicon_href) = {
+        let (sources, (img_by_url, img_urls, img_data), favicon_href) = {
             let d = booted.doc.lock().unwrap();
             (
                 collect_sheet_sources(&load.url, &d),
@@ -2569,7 +2669,7 @@ impl BrowserState {
             html,
             img_by_url,
         };
-        spawn_fetch_resources(tx, redrawer, id, base, sources, img_urls, favicon_url);
+        spawn_fetch_resources(tx, redrawer, id, base, sources, img_urls, img_data, favicon_url);
     }
 
     fn on_resources_ready(
