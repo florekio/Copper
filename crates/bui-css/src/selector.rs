@@ -100,6 +100,13 @@ pub enum PseudoClass {
     /// `:dir(ltr|rtl)` — reads the element's (or ancestor's) `dir`
     /// attribute, defaulting to "ltr".
     Dir(String),
+    /// `:placeholder-shown` — matches an `<input>`/`<textarea>` that
+    /// has a `placeholder` attribute and is currently displaying it,
+    /// i.e. its value is empty. In a static render the value is the
+    /// `value` attribute (empty by default), so an empty field with a
+    /// placeholder matches. DDG's homepage hides the search button row
+    /// via `.searchbox:has(.searchInput:placeholder-shown) ~ .buttonWrapper`.
+    PlaceholderShown,
 }
 
 /// `an + b`, with the convention that `odd` = `2n+1` and `even` = `2n`.
@@ -461,6 +468,18 @@ fn pseudo_match(pc: &PseudoClass, doc: &Document, node: NodeId) -> bool {
             // Default direction is LTR.
             want_lc == "ltr"
         }
+        PseudoClass::PlaceholderShown => doc
+            .element(node)
+            .map(|e| {
+                let is_field = matches!(e.name.as_str(), "input" | "textarea");
+                let has_placeholder = e.get_attr("placeholder").is_some();
+                // Showing the placeholder ⇔ the field is empty. Static
+                // render: the value is the `value` attribute (textarea
+                // text content isn't modeled here; treat absent as empty).
+                let empty = e.get_attr("value").map(|v| v.is_empty()).unwrap_or(true);
+                is_field && has_placeholder && empty
+            })
+            .unwrap_or(false),
     }
 }
 
@@ -781,6 +800,7 @@ impl<'a> SelParser<'a> {
             "last-of-type" => Ok(PseudoClass::LastOfType),
             "only-of-type" => Ok(PseudoClass::OnlyOfType),
             "checked" => Ok(PseudoClass::Checked),
+            "placeholder-shown" => Ok(PseudoClass::PlaceholderShown),
             "disabled" => Ok(PseudoClass::Disabled),
             "enabled" => Ok(PseudoClass::Enabled),
             "required" => Ok(PseudoClass::Required),
@@ -1105,6 +1125,36 @@ mod tests {
         // The h2 itself doesn't match :has(.title) (it has no
         // descendants).
         assert!(!Selector::parse(":has(.title)").unwrap().matches(&doc, h2));
+    }
+
+    #[test]
+    fn placeholder_shown_drives_has_sibling_rule() {
+        // Mirrors DDG's homepage searchbox:
+        //   .box:has(.field:placeholder-shown) ~ .wrap { display:none }
+        // The wrap should match (be hidden) while the input is empty.
+        let mut doc = Document::new();
+        let combobox = doc.create_element("div");
+        let box_ = doc.create_element("div");
+        let field = doc.create_element("input");
+        let wrap = doc.create_element("div");
+        doc.element_mut(box_).unwrap().set_attr("class", "box");
+        doc.element_mut(field).unwrap().set_attr("class", "field");
+        doc.element_mut(field).unwrap().set_attr("placeholder", "Search");
+        doc.element_mut(wrap).unwrap().set_attr("class", "wrap");
+        doc.append_child(doc.root, combobox);
+        doc.append_child(combobox, box_);
+        doc.append_child(box_, field);
+        doc.append_child(combobox, wrap);
+
+        let sel = Selector::parse(".box:has(.field:placeholder-shown) ~ .wrap").unwrap();
+        assert!(sel.matches(&doc, wrap), "empty field → placeholder shown → wrap hidden");
+        assert!(Selector::parse(".field:placeholder-shown").unwrap().matches(&doc, field));
+
+        // Once the field has a value, the placeholder is no longer
+        // shown, so the rule stops matching.
+        doc.element_mut(field).unwrap().set_attr("value", "cats");
+        assert!(!Selector::parse(".field:placeholder-shown").unwrap().matches(&doc, field));
+        assert!(!sel.matches(&doc, wrap));
     }
 
     #[test]
