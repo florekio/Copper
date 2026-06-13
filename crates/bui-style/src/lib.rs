@@ -372,25 +372,42 @@ fn cascade_recursive(
         None => ComputedValues::root_default(),
     };
 
-    // Walk declarations in cascade order. Custom properties (`--foo`)
-    // populate cv.vars; everything else gets var(--foo) substitution
-    // applied to its value first so apply_declaration sees a flat
-    // string with no `var()` calls. Substitution looks up the latest
-    // value of the variable as of this declaration — declarations
-    // earlier in the cascade order can be referenced by later ones.
+    // CSS custom properties cascade INDEPENDENTLY of var() substitution
+    // (CSS Variables §3): first every `--foo` resolves to its winning
+    // cascaded value, THEN `var()` references are substituted using those
+    // final values. Doing it in one interleaved pass (resolving each
+    // var() against the vars-so-far) is wrong when a referenced custom
+    // property is set by a HIGHER-specificity rule that sorts later — the
+    // referrer reads a stale/inherited value. DuckDuckGo's CTA button hit
+    // this: `.link-button_primary-solid { --button-rest-bg:
+    // var(--ds-accent-primary) }` read the inherited `.theme-light` blue
+    // instead of the `.theme-light .motif-mandarin` orange (higher
+    // specificity, sorted later), so the button rendered blue.
+    //
+    // Phase A — cascade custom properties to their winning RAW values
+    // (matches is pre-sorted ascending, so the last writer wins).
     for (_, decl) in &matches {
         if let Some(custom) = decl.name.strip_prefix("--") {
-            let resolved = substitute_vars(&decl.value, &cv.vars);
-            cv.vars.insert(format!("--{custom}"), resolved.trim().to_string());
-        } else {
-            let resolved = substitute_vars(&decl.value, &cv.vars);
-            let resolved_decl = bui_css::Declaration {
-                name: decl.name.clone(),
-                value: resolved,
-                important: decl.important,
-            };
-            values::apply_declaration(&mut cv, &resolved_decl, parent);
+            cv.vars.insert(format!("--{custom}"), decl.value.trim().to_string());
         }
+    }
+    // Phase B — resolve var() references WITHIN custom-property values to
+    // a fixed point (bounded), so `--button-rest-bg: var(--ds-accent-
+    // primary)` ends up holding the final colour, not a nested var().
+    resolve_var_map(&mut cv.vars);
+    // Phase C — apply non-custom declarations, substituting var() against
+    // the fully-resolved map.
+    for (_, decl) in &matches {
+        if decl.name.starts_with("--") {
+            continue;
+        }
+        let resolved = substitute_vars(&decl.value, &cv.vars);
+        let resolved_decl = bui_css::Declaration {
+            name: decl.name.clone(),
+            value: resolved,
+            important: decl.important,
+        };
+        values::apply_declaration(&mut cv, &resolved_decl, parent);
     }
 
     // CSS spec: `border-color` initial value is `currentcolor`.
@@ -439,11 +456,19 @@ fn build_pseudo_cv(
     let mut sorted: Vec<(CascadeKey, Declaration)> = matches.to_vec();
     sorted.sort_by(|(ka, _), (kb, _)| ka.cascade_cmp(kb));
     let mut cv = parent.inherit_into_default();
+    // Same two-phase resolution as the main cascade (see cascade_recursive):
+    // custom properties cascade first, then var() substitution.
     for (_, decl) in &sorted {
         if let Some(custom) = decl.name.strip_prefix("--") {
-            let resolved = substitute_vars(&decl.value, &cv.vars);
-            cv.vars.insert(format!("--{custom}"), resolved.trim().to_string());
-        } else {
+            cv.vars.insert(format!("--{custom}"), decl.value.trim().to_string());
+        }
+    }
+    resolve_var_map(&mut cv.vars);
+    for (_, decl) in &sorted {
+        if decl.name.starts_with("--") {
+            continue;
+        }
+        {
             let resolved = substitute_vars(&decl.value, &cv.vars);
             let resolved_decl = Declaration {
                 name: decl.name.clone(),
@@ -535,6 +560,34 @@ pub fn extract_inline_stylesheets(doc: &Document) -> Vec<Stylesheet> {
 }
 
 const USER_AGENT_CSS: &str = include_str!("ua.css");
+
+/// Resolve `var()` references that appear *inside* custom-property
+/// values, to a fixed point. After the cascade collects each `--foo`'s
+/// winning raw value (which may itself be `var(--bar)` or
+/// `var(--bar, fallback)`), this rewrites them so every entry holds a
+/// flat value. Bounded to a few passes so a cyclic reference
+/// (`--a: var(--b); --b: var(--a)`) can't loop forever — it just
+/// settles to empty, as browsers do.
+fn resolve_var_map(vars: &mut std::collections::HashMap<String, String>) {
+    // Most maps stabilize in 1–2 passes; the chains real design systems
+    // build (token → semantic → component) are shallow.
+    for _ in 0..8 {
+        let mut changed = false;
+        let snapshot = vars.clone();
+        for (_, v) in vars.iter_mut() {
+            if v.contains("var(") {
+                let resolved = substitute_vars(v, &snapshot);
+                if &resolved != v {
+                    *v = resolved;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
 
 /// Replace each top-level `var(--name)` (and `var(--name, fallback)`)
 /// in `value` with whatever `vars` resolves it to. A missing variable
@@ -951,6 +1004,38 @@ mod tests {
         let st = style_document(&doc, &[sheet]);
         let cv = st.get(div).unwrap();
         assert_eq!(cv.color, RgbaColor::rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn custom_property_indirection_uses_final_cascaded_value() {
+        // The DuckDuckGo CTA-button case: an inherited `--accent` (low
+        // specificity, on the ancestor) is overridden on the element
+        // itself by a HIGHER-specificity rule that sorts LATER, and a
+        // SEPARATE lower-specificity rule on the element reads `--accent`
+        // indirectly (`--btn-bg: var(--accent)`). The button bg must be
+        // the overriding value, not the inherited one — custom properties
+        // cascade to final values before var() substitution.
+        let mut doc = bui_dom::Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        let a = doc.create_element("a");
+        doc.element_mut(html).unwrap().set_attr("class", "theme");
+        doc.element_mut(a).unwrap().set_attr("class", "btn motif");
+        doc.append_child(doc.root, html);
+        doc.append_child(html, body);
+        doc.append_child(body, a);
+        let sheet = Stylesheet::parse(
+            ".theme { --accent: rgb(16, 116, 204) } \
+             .theme .motif { --accent: rgb(240, 95, 43) } \
+             .btn { --btn-bg: var(--accent); background-color: var(--btn-bg) }",
+        );
+        let st = style_document(&doc, &[sheet]);
+        // motif override (orange) wins over the inherited theme blue,
+        // even though `.btn` (which reads --accent) has lower specificity.
+        assert_eq!(
+            st.get(a).unwrap().background_color,
+            RgbaColor::rgb(240, 95, 43)
+        );
     }
 
     #[test]
