@@ -1915,10 +1915,23 @@ impl BindingContext {
         engine.register_host_fn("__elemClassListToggle", move |vm, _this, args| {
             let Some(handle) = args.first().copied() else { return Ok(Value::boolean(false)) };
             let Some(class) = read_str(vm, args.get(1)) else { return Ok(Value::boolean(false)) };
+            // args[2] = force-present flag, args[3] = force value. When the
+            // caller passed `toggle(token, force)`, honor it: add iff force.
+            let has_force = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+            let force = args.get(3).map(|v| v.to_boolean()).unwrap_or(false);
             let mut now_present = false;
             if let Some((nid, old)) = class_list_mutate(&s, handle, |tokens| {
-                if let Some(pos) = tokens.iter().position(|t| t == &class) {
-                    tokens.remove(pos);
+                let pos = tokens.iter().position(|t| t == &class);
+                if has_force {
+                    if force {
+                        if pos.is_none() { tokens.push(class.clone()); }
+                        now_present = true;
+                    } else {
+                        if let Some(p) = pos { tokens.remove(p); }
+                        now_present = false;
+                    }
+                } else if let Some(p) = pos {
+                    tokens.remove(p);
                     now_present = false;
                 } else {
                     tokens.push(class.clone());
@@ -2713,9 +2726,15 @@ function _makeElemWrapper(handle) {
                 contains: function(c) {
                     return __elemHasClass(h, c);
                 },
-                add: function(c) { __elemClassListAdd(h, c); },
-                remove: function(c) { __elemClassListRemove(h, c); },
-                toggle: function(c) { return __elemClassListToggle(h, c); }
+                add: function() { for (var i=0;i<arguments.length;i++) __elemClassListAdd(h, arguments[i]); },
+                remove: function() { for (var i=0;i<arguments.length;i++) __elemClassListRemove(h, arguments[i]); },
+                // classList.toggle(token[, force]): with force present, add
+                // when truthy / remove when falsy (DDG's SSG device-detect
+                // does `toggle("is-mobile", c); toggle("is-not-mobile", !c)`).
+                toggle: function(c, force) {
+                    if (arguments.length > 1) return __elemClassListToggle(h, c, true, !!force);
+                    return __elemClassListToggle(h, c, false, false);
+                }
             };
         },
         childAt: function(i) {
@@ -4419,8 +4438,6 @@ mod tests {
         assert_eq!(n.as_number(), Some(3.0));
     }
 
-    // ----- Write-side smoke tests (Tier 1 §1) -----
-
     #[test]
     fn set_attribute_writes_through_to_doc() {
         let mut engine = Engine::new();
@@ -5157,6 +5174,34 @@ mod tests {
         assert!(toks.contains("b"));
         assert!(toks.contains("c"));
         assert!(!toks.contains("a"));
+    }
+
+    #[test]
+    fn class_list_toggle_force_honors_condition() {
+        // `toggle(token, force)` must add when force is truthy and remove
+        // when falsy — NOT a blind toggle. DuckDuckGo's device-detect does
+        // `toggle("is-mobile", c); toggle("is-not-mobile", !c)`; the blind
+        // toggle added BOTH classes, leaving the homepage CSS gate
+        // (.is-not-mobile-device .promoHomepage) unable to decide.
+        let mut engine = Engine::new();
+        let doc = wrapped_doc("<body><div>x</div></body>");
+        let _ctx = BindingContext::install(&mut engine, doc.clone(), String::new());
+        engine.eval(
+            "var c=document.querySelector('div').classList;\
+             var mobile=false;\
+             c.toggle('is-mobile', mobile); c.toggle('is-not-mobile', !mobile);\
+             c.toggle('keep', true); c.toggle('keep', true);\
+             c.toggle('drop', true); c.toggle('drop', false);",
+        ).expect("eval");
+        let d = doc.lock().unwrap();
+        let div = d.descendants(d.root)
+            .find(|n| d.element(*n).map(|e| e.name == "div").unwrap_or(false)).unwrap();
+        let cls = d.element(div).and_then(|e| e.get_attr("class")).unwrap_or("");
+        let toks: std::collections::HashSet<&str> = cls.split_ascii_whitespace().collect();
+        assert!(!toks.contains("is-mobile"), "force=false must not add");
+        assert!(toks.contains("is-not-mobile"), "force=true must add");
+        assert!(toks.contains("keep"), "repeated force=true stays present");
+        assert!(!toks.contains("drop"), "force=false removes");
     }
 // temp probe — appended to dom_bindings tests
 #[test]

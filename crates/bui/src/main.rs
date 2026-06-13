@@ -1805,6 +1805,23 @@ impl TabState {
             eprintln!("[js] {line}");
             booted.console_log.push(line);
         }
+        // Debug: dump <html> and <body> class attrs after scripts settle,
+        // so the skeleton→promo CSS-gate (is-not-mobile-device /
+        // extension-not-installed) can be verified. COPPER_DEBUG_DOM=1.
+        if std::env::var("COPPER_DEBUG_DOM").is_ok() {
+            let d = booted.doc.lock().unwrap();
+            for id in d.descendants(d.root) {
+                if let Some(e) = d.element(id) {
+                    if matches!(e.name.as_str(), "html" | "body") {
+                        eprintln!(
+                            "[dom] <{}> class={:?}",
+                            e.name,
+                            e.get_attr("class").unwrap_or("")
+                        );
+                    }
+                }
+            }
+        }
         // A settled fetch handler may itself have navigated.
         if let Some(target) = booted.js_ctx.take_pending_navigation() {
             if let Ok(next_url) = url.join(&target) {

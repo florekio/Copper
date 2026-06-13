@@ -1928,18 +1928,21 @@ fn layout_flex(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32, container_h
         for i in 0..m {
             let mut child = items_iter.next().unwrap();
             let main_pixel = sizes[i];
-            // CSS Values 4 §6.6.1: percent-on-height in a child
-            // resolves against the *parent's* content height. For
-            // column flex, that's the flex container's
-            // (max-height-clamped) main_size — NOT the child's
-            // planned slice sizes[i]. For row flex, that's also
-            // the container's cross-axis (height) main_size when
-            // we have one, else fall through to whatever basis our
-            // parent gave us. We pass container's main_size as the
-            // basis only when it's explicit (user-declared height
-            // or max-height clamp); otherwise children fall back to
-            // viewport height.
-            let child_basis: Option<f32> = if main_size_was_explicit && main_size > 0.0 {
+            // CSS Values 4 §6.6.1: a child's percent-on-height resolves
+            // against the parent's content HEIGHT. The flex axis matters:
+            //   * Column flex: the main axis IS height, so the
+            //     (max-height-clamped) main_size is the right basis.
+            //   * Row flex: the main axis is WIDTH — main_size is the
+            //     container's width and must NOT be used as the height
+            //     basis (doing so made `height:100%` resolve against the
+            //     width, stretching DuckDuckGo's header into a square and
+            //     shoving the hero off-screen). The height basis is the
+            //     container's own height = `container_h`, which is `None`
+            //     when our height is indefinite — and per spec
+            //     `height:%` against an indefinite parent is just `auto`.
+            let child_basis: Option<f32> = if row {
+                container_h
+            } else if main_size_was_explicit && main_size > 0.0 {
                 Some(main_size)
             } else {
                 container_h
@@ -2143,7 +2146,16 @@ fn content_height_hint(cv: &ComputedValues, basis: f32, container_h: Option<f32>
         let (_, vh) = bui_style::viewport();
         if vh > 0.0 { vh } else { basis }
     });
+    // Plain `height: <percent>` against an indefinite parent (no definite
+    // ancestor height plumbed in) computes back to `auto` per CSS Values 4
+    // §6.6.1 — NOT the viewport. Resolving it to vh stretched
+    // DuckDuckGo's `height:100%` header (inside auto-height ancestors)
+    // into a full viewport-tall box. `calc(100% ± px)` keeps the vh
+    // fallback (Google's `.LLD4me`), and the min-height floor below
+    // still applies either way.
+    let plain_percent = matches!(cv.height, Dimension::Length(bui_style::Length::Percent(_)));
     let h = match cv.height {
+        Dimension::Length(_) if plain_percent && container_h.is_none() => 0.0,
         Dimension::Length(l) => l.resolve(cv.font_size, 16.0, height_basis),
         Dimension::Auto => 0.0,
     };

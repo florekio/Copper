@@ -600,16 +600,12 @@ impl JsContext {
             // Use host_call so a JS exception thrown inside the
             // callback comes back as Err and we route it to the
             // console buffer rather than panicking the host.
-            if self
-                .engine
-                .vm()
-                .host_call(entry.callback, &[])
-                .is_err()
-            {
+            if let Err(e) = self.engine.vm().host_call(entry.callback, &[]) {
+                let desc = self.engine.vm().describe_value(e);
                 self.engine
                     .vm()
                     .output
-                    .push("Uncaught exception in scheduled timer callback".into());
+                    .push(format!("Uncaught exception in scheduled timer callback: {desc}"));
             }
             // Re-enqueue intervals.
             if let Some(repeat) = entry.repeat {
