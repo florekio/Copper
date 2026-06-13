@@ -1611,8 +1611,26 @@ fn layout_flex(bx: &mut LayoutBox, x: f32, y: f32, container_w: f32, container_h
     let p = resolve_edges(&cv.padding, cv.font_size, container_w);
     let b = resolve_edges(&cv.border, cv.font_size, container_w);
 
-    let content_w =
-        (container_w - m.left - m.right - p.left - p.right - b.left - b.right).max(0.0);
+    // A flex container's own width: honour an explicit `width` (like
+    // layout_grid does) instead of always filling container_w. Without
+    // this, a block-level flex container ignored its `width` and stretched
+    // to fill its parent — DuckDuckGo's header menu button
+    // (`width: var(--ds-space-x06)` ⇒ 24px) blew up to its container's
+    // 241px, dragging the whole header-right nav past the viewport edge.
+    // `width: auto` still fills (block default); only an explicit length /
+    // percent narrows the box.
+    let content_w = match cv.width {
+        Dimension::Auto => (container_w - m.left - m.right - p.left - p.right - b.left - b.right)
+            .max(0.0),
+        Dimension::Length(l) => {
+            let raw = l.resolve(cv.font_size, 16.0, container_w);
+            if matches!(cv.box_sizing, bui_style::BoxSizing::BorderBox) {
+                (raw - p.left - p.right - b.left - b.right).max(0.0)
+            } else {
+                raw
+            }
+        }
+    };
     let outer_x = x;
     let outer_y = y;
     let content_x = outer_x + m.left + b.left + p.left;
@@ -5961,6 +5979,49 @@ mod tests {
             }
         }
         assert!(ax > bxx, "row-reverse: A (x={ax}) must be right of B (x={bxx})");
+    }
+
+    #[test]
+    fn flex_container_honours_explicit_width() {
+        // A block-level flex container with an explicit `width` must use
+        // it, not stretch to fill its parent. DuckDuckGo's header menu
+        // button (`display:flex; width:40px`) was blowing up to its
+        // container width and shoving the nav past the viewport edge.
+        let (doc, style) = doc_from_html(
+            "<style>\
+                 body { margin: 0 }\
+                 .outer { width: 400px }\
+                 .fbox { display: flex; width: 40px; height: 20px }\
+             </style>\
+             <body><div class=\"outer\"><div class=\"fbox\">x</div></div></body>",
+        );
+        let body = doc
+            .descendants(doc.root)
+            .find(|n| doc.element(*n).map(|e| e.name == "body").unwrap_or(false))
+            .unwrap();
+        let mut bx = build(&doc, &style, body);
+        layout(&mut bx, 0.0, 0.0, 800.0);
+        fn width_of<'a>(bx: &'a LayoutBox, doc: &Document, cls: &str) -> Option<f32> {
+            if bx
+                .node
+                .and_then(|n| doc.element(n))
+                .map(|e| e.classes().any(|c| c == cls))
+                .unwrap_or(false)
+            {
+                return Some(bx.frame.width);
+            }
+            for c in &bx.children {
+                if let Some(w) = width_of(c, doc, cls) {
+                    return Some(w);
+                }
+            }
+            None
+        }
+        let w = width_of(&bx, &doc, "fbox").expect("flex box");
+        assert!(
+            (w - 40.0).abs() < 0.5,
+            "flex container width should be 40 (explicit), got {w}"
+        );
     }
 
     #[test]
