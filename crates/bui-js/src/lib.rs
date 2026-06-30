@@ -167,7 +167,9 @@ impl JsContext {
         // (Wikipedia, the dev-dock probe page) yet aborts a true
         // infinite loop in under a second. Without this the
         // browser thread blocks forever on bad JS.
-        engine.set_max_steps(50_000_000);
+        engine.set_max_steps(
+            std::env::var("COPPER_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(50_000_000),
+        );
         // Silence Zinc's default stdout / stderr writes for
         // `console.log / warn / error`. The embedder is the
         // single source of truth for routing those lines into
