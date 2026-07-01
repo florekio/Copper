@@ -17,6 +17,38 @@ client-side JS — which is most of the modern web. Treat Google as
 the canonical hard target; smaller sites should fall out of the
 same plumbing.
 
+Update (July 2026) — heavy-SPA bring-up (DuckDuckGo SERP):
+
+Real JS-heavy result pages (the DDG SERP as the canonical target)
+now get much further. The blockers were engine-correctness and
+missing-DOM-surface bugs, not throughput — each fix is load-bearing
+for any Closure/webpack/jQuery site:
+
+- **RegExp**: global/sticky `exec` now advances `lastIndex` (was an
+  infinite loop on `while ((m = re.exec(s)))` — the original SERP
+  fuel-exhaustion blocker); `replace`/`replaceAll` fire a function
+  replacement per match; `matchAll` implemented; Rust-built arrays
+  (split/match/matchAll + the embedder `alloc_array`) now carry
+  `Array.prototype` so `for…of` over them works.
+- **Objects/functions**: `fn[key] = v` (computed writes onto function
+  values) now store — jQuery *is* a function and `jQuery.extend`
+  copies its statics this way, so this unblocked jQuery init.
+- **for-in**: fixed a compiler bug where a nested `for-in` clobbered
+  the outer loop's iterator (hoisted-loop-var slot aliasing) — this
+  was DDG's localization (Jed/Gettext) blocker.
+- **DOM**: `document.childNodes` + `document.nodeType`, and element
+  `getElementsByTagName`/`getElementsByClassName` (Sizzle/jQuery
+  feature-detection needs them).
+
+Result: the SERP clears the fuel wall, jQuery loads and defines `$`,
+and the locale/gettext layer initializes. Remaining failures are in
+DDG's own framework layer (a templating `registerHelper`, an
+`instanceof` on an undefined RHS, `DDG.deep.*`). Diagnostics added:
+`ZINC_FUEL_TRACE=1` (locate runaway loops), `COPPER_DUMP_SCRIPTS=1`
+(dump each executed script), `COPPER_MAX_STEPS` (override the fuel
+budget). Note: copper's error "line N" is a source **byte offset**,
+not a file line, on minified bundles.
+
 Milestone status (May 2026):
 
 Phases 1–5 shipped. Phase 6 shipped on the engine side and on
