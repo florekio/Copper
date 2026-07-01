@@ -270,6 +270,10 @@ impl JsContext {
             } else {
                 source.clone()
             };
+            if std::env::var("COPPER_DUMP_SCRIPTS").is_ok() {
+                let _ = std::fs::create_dir_all("/tmp/copper_scripts");
+                let _ = std::fs::write(format!("/tmp/copper_scripts/{script_idx}.js"), &rewritten);
+            }
             let (result, mut output) = engine.eval_with_output(&rewritten);
             if is_script_error(&result) {
                 // Capture a source preview so the dev-dock

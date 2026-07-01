@@ -2718,6 +2718,40 @@ function _makeElemWrapper(handle) {
             for (var i = 0; i < raw.length; i++) out.push(_wrapElem(raw[i]));
             return out;
         },
+        // Element-scoped getElementsByTagName / getElementsByClassName: a
+        // descendant walk (snapshot Array, not a live HTMLCollection). Libraries
+        // call these on detached elements during feature detection — jQuery's
+        // support probe does `f.getElementsByTagName("a")[0]` on a fresh <div>,
+        // which threw when the method was absent.
+        getElementsByTagName: function(tag) {
+            var want = ('' + tag).toLowerCase(), all = want === '*', out = [];
+            function walk(node) {
+                var kids = node.children;
+                for (var i = 0; i < kids.length; i++) {
+                    var c = kids[i];
+                    if (all || (c.tagName && c.tagName.toLowerCase() === want)) out.push(c);
+                    walk(c);
+                }
+            }
+            walk(this);
+            return out;
+        },
+        getElementsByClassName: function(cls) {
+            var want = ('' + cls).split(' ').filter(function(x) { return x !== ''; }), out = [];
+            function walk(node) {
+                var kids = node.children;
+                for (var i = 0; i < kids.length; i++) {
+                    var c = kids[i], ok = want.length > 0;
+                    for (var j = 0; j < want.length; j++) {
+                        if (!c.classList.contains(want[j])) { ok = false; break; }
+                    }
+                    if (ok) out.push(c);
+                    walk(c);
+                }
+            }
+            walk(this);
+            return out;
+        },
         get classList() {
             var h = this._h;
             return {
@@ -3002,6 +3036,17 @@ var document = {
     get documentElement() {
         return _wrapElem(__qs("html"));
     },
+    // The document node's childNodes. Real browsers expose the doctype +
+    // root <html>; a NodeList containing documentElement is enough for the
+    // array-like probes that libraries run (Sizzle does
+    // `slice.call(document.childNodes)` + `document.childNodes.length`
+    // during setup, and throws uncaught without it).
+    get childNodes() {
+        var el = _wrapElem(__qs("html"));
+        return el ? [el] : [];
+    },
+    // Document node type per the DOM (DOCUMENT_NODE === 9).
+    nodeType: 9,
     querySelector: function(s) {
         return _wrapElem(__qs(s));
     },
